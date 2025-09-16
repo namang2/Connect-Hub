@@ -21,8 +21,13 @@ const MyChats = ({ fetchAgain }) => {
     try {
       const config = {
         headers: {
-          Authorization: `Bearer ${user.token}`,
-        },
+        Authorization: `Bearer ${user.token}`,
+        // Add these three lines to prevent caching
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+
       };
 
       const { data } = await axios.get("/api/chat", config);
@@ -41,9 +46,11 @@ const MyChats = ({ fetchAgain }) => {
 
   useEffect(() => {
     setLoggedUser(JSON.parse(localStorage.getItem("userInfo")));
+    if (user) {
     fetchChats();
+  }
     // eslint-disable-next-line
-  }, [fetchAgain]);
+  }, [user,fetchAgain]);
 
   return (
     <Box
