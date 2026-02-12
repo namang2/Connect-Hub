@@ -162,15 +162,14 @@ const forgotPassword = asyncHandler(async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Failed to send reset email:", error.message);
+    console.error("   Full error:", error);
     
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
     await user.save({ validateBeforeSave: false });
 
     res.status(500);
-    throw new Error(
-      "Unable to send password reset email right now. Please try again later."
-    );
+    throw new Error(error.message || "Unable to send password reset email right now. Please try again later.");
   }
 });
 

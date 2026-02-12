@@ -1,16 +1,24 @@
 const nodemailer = require("nodemailer");
 
 const sendEmail = async (options) => {
+  // Debug: Log environment variable status (not values for security)
+  console.log("📧 Email sending initiated...");
+  console.log("   EMAIL_USER set:", !!process.env.EMAIL_USER, process.env.EMAIL_USER ? `(${process.env.EMAIL_USER.substring(0, 3)}...@${process.env.EMAIL_USER.split("@")[1] || "?"})` : "");
+  console.log("   EMAIL_PASS set:", !!process.env.EMAIL_PASS, process.env.EMAIL_PASS ? `(length: ${process.env.EMAIL_PASS.length})` : "");
+  console.log("   NODE_ENV:", process.env.NODE_ENV);
+  console.log("   FRONTEND_URL:", process.env.FRONTEND_URL || "NOT SET");
+
   // Check if email credentials are configured
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.log("=================================================");
-    console.log("📧 EMAIL CONFIGURATION MISSING");
-    console.log("=================================================");
-    console.log("To enable email functionality, add these environment variables:");
-    console.log("EMAIL_USER=your_gmail@gmail.com");
-    console.log("EMAIL_PASS=your_gmail_app_password");
-    console.log("FRONTEND_URL=https://your-deployed-url.onrender.com");
-    console.log("=================================================");
+    console.error("=================================================");
+    console.error("❌ EMAIL CONFIGURATION MISSING");
+    console.error("=================================================");
+    console.error("EMAIL_USER exists:", !!process.env.EMAIL_USER);
+    console.error("EMAIL_PASS exists:", !!process.env.EMAIL_PASS);
+    console.error("Make sure these env vars are set in Render Dashboard:");
+    console.error("  EMAIL_USER=your_gmail@gmail.com");
+    console.error("  EMAIL_PASS=your_16_char_app_password");
+    console.error("=================================================");
 
     // In development, log the reset link for testing
     if (process.env.NODE_ENV !== "production") {
@@ -27,13 +35,11 @@ const sendEmail = async (options) => {
     }
 
     throw new Error(
-      "Password reset is temporarily unavailable. Please try again later or contact support."
+      "Email credentials (EMAIL_USER / EMAIL_PASS) are not configured on the server. Please add them in Render environment variables."
     );
   }
 
   // Create transporter with Gmail SMTP
-  // This works for sending emails TO any email provider (Gmail, Yahoo, Outlook, etc.)
-  // The EMAIL_USER is just the "from" address used to send the email
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: {
@@ -50,13 +56,19 @@ const sendEmail = async (options) => {
     await transporter.verify();
     console.log("✅ Email transporter verified successfully");
   } catch (verifyError) {
-    console.error("❌ Email transporter verification failed:", verifyError.message);
+    console.error("❌ Email transporter verification FAILED!");
+    console.error("   Error:", verifyError.message);
+    console.error("   Code:", verifyError.code);
+    console.error("   This usually means:");
+    console.error("   1. EMAIL_USER is not a valid Gmail address");
+    console.error("   2. EMAIL_PASS is not a valid App Password (must be 16 chars, no spaces)");
+    console.error("   3. 2-Step Verification is not enabled on the Gmail account");
     throw new Error(
-      "Unable to send email right now. Please try again later."
+      `Gmail authentication failed. Please check your EMAIL_USER and EMAIL_PASS. Error: ${verifyError.message}`
     );
   }
 
-  // Email options - sends to ANY email address (Gmail, Yahoo, Outlook, Hotmail, etc.)
+  // Email options
   const mailOptions = {
     from: `"Connect Hub" <${process.env.EMAIL_USER}>`,
     to: options.email,
@@ -65,9 +77,16 @@ const sendEmail = async (options) => {
   };
 
   // Send email
-  const info = await transporter.sendMail(mailOptions);
-  console.log("✅ Email sent successfully to:", options.email, "MessageId:", info.messageId);
-  return info;
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log("✅ Email sent successfully to:", options.email, "MessageId:", info.messageId);
+    return info;
+  } catch (sendError) {
+    console.error("❌ Email sending FAILED!");
+    console.error("   Error:", sendError.message);
+    console.error("   Code:", sendError.code);
+    throw new Error(`Failed to send email: ${sendError.message}`);
+  }
 };
 
 // Password reset email template
