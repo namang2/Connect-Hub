@@ -10,12 +10,6 @@ const sendEmail = async (options) => {
     console.log("EMAIL_USER=your_gmail@gmail.com");
     console.log("EMAIL_PASS=your_gmail_app_password");
     console.log("FRONTEND_URL=https://your-deployed-url.onrender.com");
-    console.log("");
-    console.log("To get an App Password for Gmail:");
-    console.log("1. Go to Google Account Settings > Security");
-    console.log("2. Enable 2-Step Verification");
-    console.log("3. Go to App Passwords > Generate a new app password");
-    console.log("4. Use the generated 16-char password as EMAIL_PASS");
     console.log("=================================================");
 
     // In development, log the reset link for testing
@@ -33,11 +27,13 @@ const sendEmail = async (options) => {
     }
 
     throw new Error(
-      "Email service is not configured. Please set EMAIL_USER and EMAIL_PASS environment variables on your hosting platform."
+      "Password reset is temporarily unavailable. Please try again later or contact support."
     );
   }
 
-  // Create transporter with Gmail
+  // Create transporter with Gmail SMTP
+  // This works for sending emails TO any email provider (Gmail, Yahoo, Outlook, etc.)
+  // The EMAIL_USER is just the "from" address used to send the email
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: {
@@ -56,12 +52,11 @@ const sendEmail = async (options) => {
   } catch (verifyError) {
     console.error("❌ Email transporter verification failed:", verifyError.message);
     throw new Error(
-      "Email service configuration error. Please check EMAIL_USER and EMAIL_PASS. " +
-      "Make sure you are using a Gmail App Password (not your regular password)."
+      "Unable to send email right now. Please try again later."
     );
   }
 
-  // Email options
+  // Email options - sends to ANY email address (Gmail, Yahoo, Outlook, Hotmail, etc.)
   const mailOptions = {
     from: `"Connect Hub" <${process.env.EMAIL_USER}>`,
     to: options.email,
@@ -71,7 +66,7 @@ const sendEmail = async (options) => {
 
   // Send email
   const info = await transporter.sendMail(mailOptions);
-  console.log("✅ Email sent successfully:", info.messageId);
+  console.log("✅ Email sent successfully to:", options.email, "MessageId:", info.messageId);
   return info;
 };
 

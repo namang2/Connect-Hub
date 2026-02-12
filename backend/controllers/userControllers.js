@@ -158,7 +158,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
 
     res.json({
       success: true,
-      message: "Password reset email sent successfully",
+      message: `Password reset link has been sent to ${user.email}. Please check your inbox and spam folder.`,
     });
   } catch (error) {
     console.error("❌ Failed to send reset email:", error.message);
@@ -168,7 +168,9 @@ const forgotPassword = asyncHandler(async (req, res) => {
     await user.save({ validateBeforeSave: false });
 
     res.status(500);
-    throw new Error(error.message || "Email could not be sent. Please try again later.");
+    throw new Error(
+      "Unable to send password reset email right now. Please try again later."
+    );
   }
 });
 
