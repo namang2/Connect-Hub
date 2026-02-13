@@ -2,6 +2,7 @@ const asyncHandler = require("express-async-handler");
 const Message = require("../models/messageModel");
 const User = require("../models/userModel");
 const Chat = require("../models/chatModel");
+const cloudinary = require("../config/cloudinary");
 
 //@description     Get all Messages
 //@route           GET /api/Message/:chatId
@@ -215,7 +216,7 @@ const updateLiveLocation = asyncHandler(async (req, res) => {
   }
 });
 
-//@description     Download file via proxy (avoids CORS issues)
+//@description     Download file via proxy (avoids CORS & Cloudinary 401 issues)
 //@route           GET /api/Message/download
 //@access          Protected
 const downloadFileProxy = asyncHandler(async (req, res) => {
@@ -226,9 +227,14 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     throw new Error("File URL is required");
   }
 
+  const https = require("https");
+  const http = require("http");
+
+  const fileName = name || "download";
+
   // Determine correct content-type from file extension
-  const getContentTypeFromName = (fileName) => {
-    const ext = (fileName || "").split(".").pop().toLowerCase();
+  const getContentTypeFromName = (fn) => {
+    const ext = (fn || "").split(".").pop().toLowerCase();
     const mimeTypes = {
       pdf: "application/pdf",
       doc: "application/msword",
@@ -264,136 +270,167 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     return mimeTypes[ext] || "application/octet-stream";
   };
 
-  try {
-    const https = require("https");
-    const http = require("http");
+  // ── Helper: parse a Cloudinary URL into resource_type + public_id path ──
+  const parseCloudinaryUrl = (cloudUrl) => {
+    // Pattern: /res.cloudinary.com/{cloud}/{resource_type}/upload/{optional_version}/{path.ext}
+    const match = cloudUrl.match(
+      /res\.cloudinary\.com\/[^/]+\/(\w+)\/upload\/(?:v\d+\/)?(.+)$/
+    );
+    if (!match) return null;
 
-    const fileName = name || "download";
+    const resourceType = match[1]; // "image" | "video" | "raw"
+    const fullPath = match[2]; // e.g. "chat-app-files/abc.pdf" or "abc.jpg"
 
-    // Transform Cloudinary URL to ensure we get the original file
-    // PDFs stored as "image" type need fl_attachment to return original PDF
-    let downloadUrl = url;
-    if (url.includes("cloudinary.com") && url.includes("/upload/")) {
-      const fileExt = (fileName || url).split(".").pop().toLowerCase();
-      const isDocument = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "rar", "7z"].includes(fileExt);
-
-      if (isDocument && !url.includes("fl_attachment")) {
-        // Add fl_attachment to force original file delivery (not rasterized image)
-        downloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
-        console.log("📎 Transformed Cloudinary URL for document download:", downloadUrl);
-      }
+    // For raw resources the extension is part of the public_id
+    if (resourceType === "raw") {
+      return { resourceType, publicId: fullPath };
     }
 
-    // Recursive function to follow redirects (up to 10 levels)
-    const fetchWithRedirects = (fetchUrl, redirectCount = 0, isRetryWithOriginal = false) => {
-      if (redirectCount > 10) {
-        if (!res.headersSent) {
-          res.status(500).json({ message: "Too many redirects" });
-        }
-        return;
+    // For image/video, strip the extension (Cloudinary treats it as "format")
+    const lastDot = fullPath.lastIndexOf(".");
+    if (lastDot > 0) {
+      return {
+        resourceType,
+        publicId: fullPath.substring(0, lastDot),
+        format: fullPath.substring(lastDot + 1),
+      };
+    }
+    return { resourceType, publicId: fullPath };
+  };
+
+  // ── Helper: generate a Cloudinary *signed* URL with fl_attachment ──
+  const getSignedCloudinaryUrl = (cloudUrl) => {
+    const parsed = parseCloudinaryUrl(cloudUrl);
+    if (!parsed) return null;
+
+    try {
+      const opts = {
+        resource_type: parsed.resourceType,
+        sign_url: true,
+        secure: true,
+        type: "upload",
+        flags: "attachment", // forces download, not browser preview
+      };
+
+      if (parsed.format && parsed.resourceType !== "raw") {
+        opts.format = parsed.format;
       }
 
-      let parsedUrl;
-      try {
-        parsedUrl = new URL(fetchUrl);
-      } catch (e) {
-        if (!res.headersSent) {
-          res.status(400).json({ message: "Invalid URL" });
-        }
-        return;
-      }
+      const signedUrl = cloudinary.url(
+        parsed.resourceType === "raw" ? parsed.publicId : parsed.publicId,
+        opts
+      );
+      console.log("🔑 Generated signed Cloudinary URL:", signedUrl);
+      return signedUrl;
+    } catch (err) {
+      console.error("Failed to generate signed Cloudinary URL:", err.message);
+      return null;
+    }
+  };
 
-      const protocol = parsedUrl.protocol === "https:" ? https : http;
+  // ── Decide which URL to fetch ──
+  let downloadUrl = url;
 
-      const request = protocol.get(fetchUrl, { timeout: 30000 }, (fileResponse) => {
-        // Follow redirects
-        if ([301, 302, 303, 307, 308].includes(fileResponse.statusCode)) {
-          const redirectUrl = fileResponse.headers.location;
-          if (redirectUrl) {
-            const absoluteUrl = redirectUrl.startsWith("http")
-              ? redirectUrl
-              : new URL(redirectUrl, fetchUrl).toString();
-            // Consume the redirect response to free up the socket
-            fileResponse.resume();
-            fetchWithRedirects(absoluteUrl, redirectCount + 1);
-            return;
-          }
-        }
+  if (url.includes("cloudinary.com") && url.includes("/upload/")) {
+    // Try signed URL first (bypasses 401 strict-transformations)
+    const signed = getSignedCloudinaryUrl(url);
+    if (signed) {
+      downloadUrl = signed;
+    } else {
+      // Fallback: just add fl_attachment to the original URL
+      downloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
+    }
+  }
 
-        if (fileResponse.statusCode !== 200) {
-          // Consume response to free socket
+  // ── Fetch the file, follow redirects, and pipe to client ──
+  const fetchAndStream = (fetchUrl, redirectCount = 0, isRetry = false) => {
+    if (redirectCount > 10) {
+      if (!res.headersSent) res.status(500).json({ message: "Too many redirects" });
+      return;
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(fetchUrl);
+    } catch (e) {
+      if (!res.headersSent) res.status(400).json({ message: "Invalid URL" });
+      return;
+    }
+
+    const protocol = parsedUrl.protocol === "https:" ? https : http;
+
+    const request = protocol.get(fetchUrl, { timeout: 30000 }, (fileResponse) => {
+      // Follow redirects
+      if ([301, 302, 303, 307, 308].includes(fileResponse.statusCode)) {
+        const loc = fileResponse.headers.location;
+        if (loc) {
           fileResponse.resume();
+          const abs = loc.startsWith("http") ? loc : new URL(loc, fetchUrl).toString();
+          fetchAndStream(abs, redirectCount + 1, isRetry);
+          return;
+        }
+      }
 
-          // If fl_attachment URL failed, retry with original URL
-          if (!isRetryWithOriginal && fetchUrl !== url) {
-            console.log(`📎 fl_attachment URL returned ${fileResponse.statusCode}, retrying with original URL...`);
-            fetchWithRedirects(url, 0, true);
-            return;
-          }
+      if (fileResponse.statusCode !== 200) {
+        fileResponse.resume();
 
-          if (!res.headersSent) {
-            res.status(fileResponse.statusCode || 500).json({
-              message: `File not found or unavailable (status: ${fileResponse.statusCode})`,
-            });
-          }
+        // If the signed / fl_attachment URL failed, retry with the raw original URL
+        if (!isRetry && fetchUrl !== url) {
+          console.log(
+            `⚠️ Download URL returned ${fileResponse.statusCode}, retrying with original URL...`
+          );
+          fetchAndStream(url, 0, true);
           return;
         }
 
-        // Determine content type from file name (most reliable)
-        // Cloudinary often returns wrong content-type for documents (e.g. image/png for PDFs)
-        const nameBasedType = getContentTypeFromName(fileName);
-        const serverContentType = fileResponse.headers["content-type"] || "";
-        // Use name-based type if it's specific, otherwise use server's response
-        const contentType =
-          nameBasedType !== "application/octet-stream"
-            ? nameBasedType
-            : serverContentType || "application/octet-stream";
-
-        // Set download headers
-        res.setHeader("Content-Type", contentType);
-        res.setHeader(
-          "Content-Disposition",
-          `attachment; filename="${encodeURIComponent(fileName)}"`
-        );
-        res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
-        if (fileResponse.headers["content-length"]) {
-          res.setHeader("Content-Length", fileResponse.headers["content-length"]);
-        }
-
-        // Pipe the file data to the response
-        fileResponse.pipe(res);
-
-        // Handle pipe errors
-        fileResponse.on("error", (err) => {
-          console.error("Download stream error:", err);
-          if (!res.headersSent) {
-            res.status(500).json({ message: "Error streaming file" });
-          }
-        });
-      });
-
-      request.on("error", (err) => {
-        console.error("Download proxy request error:", err);
         if (!res.headersSent) {
-          res.status(500).json({ message: "Error downloading file: " + err.message });
+          res.status(fileResponse.statusCode || 500).json({
+            message: `File not found or unavailable (status: ${fileResponse.statusCode})`,
+          });
         }
-      });
+        return;
+      }
 
-      request.on("timeout", () => {
-        request.destroy();
-        if (!res.headersSent) {
-          res.status(504).json({ message: "Download request timed out" });
-        }
-      });
-    };
+      // Content type — prefer our lookup over what the server says
+      const nameBasedType = getContentTypeFromName(fileName);
+      const serverType = fileResponse.headers["content-type"] || "";
+      const contentType =
+        nameBasedType !== "application/octet-stream"
+          ? nameBasedType
+          : serverType || "application/octet-stream";
 
-    fetchWithRedirects(downloadUrl);
-  } catch (error) {
-    console.error("Download proxy error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ message: "Error downloading file: " + error.message });
-    }
-  }
+      // Force-download headers
+      res.setHeader("Content-Type", contentType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${encodeURIComponent(fileName)}"`
+      );
+      res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+      if (fileResponse.headers["content-length"]) {
+        res.setHeader("Content-Length", fileResponse.headers["content-length"]);
+      }
+
+      fileResponse.pipe(res);
+
+      fileResponse.on("error", (err) => {
+        console.error("Download stream error:", err);
+        if (!res.headersSent) res.status(500).json({ message: "Error streaming file" });
+      });
+    });
+
+    request.on("error", (err) => {
+      console.error("Download proxy error:", err);
+      if (!res.headersSent)
+        res.status(500).json({ message: "Error downloading file: " + err.message });
+    });
+
+    request.on("timeout", () => {
+      request.destroy();
+      if (!res.headersSent) res.status(504).json({ message: "Download request timed out" });
+    });
+  };
+
+  fetchAndStream(downloadUrl);
 });
 
 //@description     Send Call Record Message

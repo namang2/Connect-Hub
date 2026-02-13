@@ -44,6 +44,7 @@ const uploadFile = asyncHandler(async (req, res) => {
           use_filename: true,
           unique_filename: true,
           overwrite: false,
+          access_mode: "public", // ensure files are publicly accessible
         },
         (error, result) => {
           if (error) {

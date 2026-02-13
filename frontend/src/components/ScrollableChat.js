@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { Avatar } from "@chakra-ui/avatar";
 import { Tooltip } from "@chakra-ui/tooltip";
-import { Image, Link, Box, Text, Icon, Badge, Flex, IconButton } from "@chakra-ui/react";
+import { Image, Link, Box, Text, Icon, Badge, Flex, IconButton, Spinner } from "@chakra-ui/react";
 import { DownloadIcon, ExternalLinkIcon } from "@chakra-ui/icons";
 import ScrollableFeed from "react-scrollable-feed";
 import {
@@ -34,91 +35,40 @@ const triggerBlobDownload = (blob, fileName) => {
   }, 500);
 };
 
-// Helper function to download file - uses multiple strategies for reliability
+// Download file — ALWAYS goes through backend proxy which uses
+// Cloudinary signed URLs (bypasses 401) and forces attachment download.
 const downloadFile = async (url, fileName) => {
   const safeName = fileName || "download";
 
-  // ===== STRATEGY 1: Backend proxy (most reliable — works for ALL file types) =====
-  // The proxy handles fl_attachment for Cloudinary docs, correct content-type, and CORS
   try {
     const userInfo = JSON.parse(localStorage.getItem("userInfo"));
-    if (userInfo?.token) {
-      const proxyUrl = `/api/message/download?url=${encodeURIComponent(
-        url
-      )}&name=${encodeURIComponent(safeName)}`;
+    if (!userInfo?.token) throw new Error("Not authenticated");
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+    const proxyUrl = `/api/message/download?url=${encodeURIComponent(
+      url
+    )}&name=${encodeURIComponent(safeName)}`;
 
-      const response = await fetch(proxyUrl, {
-        headers: {
-          Authorization: `Bearer ${userInfo.token}`,
-        },
-        signal: controller.signal,
-      });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s timeout
 
-      clearTimeout(timeoutId);
+    const response = await fetch(proxyUrl, {
+      headers: { Authorization: `Bearer ${userInfo.token}` },
+      signal: controller.signal,
+    });
 
-      if (response.ok) {
-        const blob = await response.blob();
-        if (blob.size > 0) {
-          triggerBlobDownload(blob, safeName);
-          return;
-        }
-      }
-      console.log("Proxy download: status", response.status, "- trying next strategy...");
-    }
-  } catch (proxyErr) {
-    if (proxyErr.name === "AbortError") {
-      console.log("Proxy download timed out, trying next strategy...");
-    } else {
-      console.log("Proxy download failed:", proxyErr.message);
-    }
-  }
+    clearTimeout(timeoutId);
 
-  // ===== STRATEGY 2: Cloudinary fl_attachment (for image/video Cloudinary URLs) =====
-  if (url && url.includes("cloudinary.com") && url.includes("/upload/")) {
-    try {
-      const cloudinaryDownloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
-      const response = await fetch(cloudinaryDownloadUrl);
-      if (response.ok) {
-        const blob = await response.blob();
-        if (blob.size > 0) {
-          triggerBlobDownload(blob, safeName);
-          return;
-        }
-      }
-    } catch (cloudErr) {
-      console.log("Cloudinary fl_attachment failed:", cloudErr.message);
-    }
-  }
-
-  // ===== STRATEGY 3: Direct fetch (may work if CORS allows) =====
-  try {
-    const directResponse = await fetch(url, { mode: "cors" });
-    if (directResponse.ok) {
-      const blob = await directResponse.blob();
+    if (response.ok) {
+      const blob = await response.blob();
       if (blob.size > 0) {
         triggerBlobDownload(blob, safeName);
         return;
       }
     }
-  } catch (directErr) {
-    console.log("Direct fetch failed:", directErr.message);
-  }
-
-  // ===== STRATEGY 4: Anchor tag with download attribute =====
-  try {
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = safeName;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    document.body.appendChild(link);
-    link.click();
-    setTimeout(() => document.body.removeChild(link), 500);
+    throw new Error(`Server returned status ${response.status}`);
   } catch (err) {
-    // Last resort: open in new tab
+    console.error("Download failed:", err.message);
+    // Absolute last resort: open in new tab
     window.open(url, "_blank");
   }
 };
@@ -248,15 +198,40 @@ const LocationMessage = ({ location, isSender }) => {
   );
 };
 
-// File message component with proper download
+// File message component — ALL files download through backend proxy
 const FileMessage = ({ file, isSender }) => {
+  const [downloading, setDownloading] = useState(false);
+
   if (!file || !file.url) return null;
 
-  const handleDownload = (e) => {
+  const handleDownload = async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    downloadFile(file.url, file.name);
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      await downloadFile(file.url, file.name);
+    } finally {
+      setDownloading(false);
+    }
   };
+
+  // Download button used across all file types
+  const DownloadBtn = ({ size = "sm", position, top, right, ...rest }) => (
+    <IconButton
+      icon={downloading ? <Spinner size="xs" /> : <DownloadIcon />}
+      position={position}
+      top={top}
+      right={right}
+      size={size}
+      colorScheme="purple"
+      borderRadius="full"
+      onClick={handleDownload}
+      isDisabled={downloading}
+      aria-label="Download"
+      {...rest}
+    />
+  );
 
   // Image files
   if (file.type === "image") {
@@ -270,21 +245,12 @@ const FileMessage = ({ file, isSender }) => {
             maxH="250px"
             objectFit="cover"
             cursor="pointer"
-            onClick={() => window.open(file.url, '_blank')}
+            onClick={handleDownload}
             _hover={{ transform: "scale(1.02)", transition: "all 0.2s" }}
             boxShadow="md"
+            opacity={downloading ? 0.6 : 1}
           />
-          <IconButton
-            icon={<DownloadIcon />}
-            position="absolute"
-            top={2}
-            right={2}
-            size="sm"
-            colorScheme="purple"
-            borderRadius="full"
-            onClick={handleDownload}
-            aria-label="Download"
-          />
+          <DownloadBtn position="absolute" top={2} right={2} />
         </Box>
         {file.name && (
           <Text fontSize="xs" mt={1} color="gray.500" isTruncated>
@@ -312,17 +278,7 @@ const FileMessage = ({ file, isSender }) => {
             <source src={file.url} />
             Your browser does not support video.
           </video>
-          <IconButton
-            icon={<DownloadIcon />}
-            position="absolute"
-            top={2}
-            right={2}
-            size="sm"
-            colorScheme="purple"
-            borderRadius="full"
-            onClick={handleDownload}
-            aria-label="Download"
-          />
+          <DownloadBtn position="absolute" top={2} right={2} />
         </Box>
         {file.name && (
           <Text fontSize="xs" mt={1} color="gray.500" isTruncated>
@@ -346,14 +302,7 @@ const FileMessage = ({ file, isSender }) => {
           <Text fontSize="xs" color="gray.600" fontWeight="500">
             🎵 Audio File
           </Text>
-          <IconButton
-            icon={<DownloadIcon />}
-            size="xs"
-            colorScheme="purple"
-            borderRadius="full"
-            onClick={handleDownload}
-            aria-label="Download"
-          />
+          <DownloadBtn size="xs" />
         </Flex>
         <audio controls style={{ maxWidth: "250px", width: "100%" }}>
           <source src={file.url} />
@@ -368,7 +317,7 @@ const FileMessage = ({ file, isSender }) => {
     );
   }
 
-  // Document/Other files - with proper download
+  // Document / Other files
   return (
     <Box
       bgGradient={isSender ? "linear(to-r, purple.100, blue.100)" : "linear(to-r, pink.100, orange.100)"}
@@ -383,6 +332,7 @@ const FileMessage = ({ file, isSender }) => {
       boxShadow="sm"
       cursor="pointer"
       onClick={handleDownload}
+      opacity={downloading ? 0.7 : 1}
     >
       <Box
         bg={isSender ? "purple.500" : "pink.500"}
@@ -391,14 +341,14 @@ const FileMessage = ({ file, isSender }) => {
         color="white"
         flexShrink={0}
       >
-        <Icon as={DownloadIcon} boxSize={5} />
+        {downloading ? <Spinner size="sm" color="white" /> : <Icon as={DownloadIcon} boxSize={5} />}
       </Box>
       <Box flex="1" minW={0}>
         <Text fontSize="sm" fontWeight="600" isTruncated color="gray.700">
           {file.name || "File"}
         </Text>
         <Text fontSize="xs" color="gray.500">
-          {formatFileSize(file.size)} • Click to download
+          {formatFileSize(file.size)} • {downloading ? "Downloading..." : "Click to download"}
         </Text>
       </Box>
     </Box>
