@@ -232,7 +232,7 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
 
   const fileName = name || "download";
 
-  // Determine correct content-type from file extension
+  // ── Content-type lookup from file extension ──
   const getContentTypeFromName = (fn) => {
     const ext = (fn || "").split(".").pop().toLowerCase();
     const mimeTypes = {
@@ -270,23 +270,27 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     return mimeTypes[ext] || "application/octet-stream";
   };
 
-  // ── Helper: parse a Cloudinary URL into resource_type + public_id path ──
+  // ── Parse Cloudinary URL → resource_type, publicId, format ──
   const parseCloudinaryUrl = (cloudUrl) => {
-    // Pattern: /res.cloudinary.com/{cloud}/{resource_type}/upload/{optional_version}/{path.ext}
     const match = cloudUrl.match(
       /res\.cloudinary\.com\/[^/]+\/(\w+)\/upload\/(?:v\d+\/)?(.+)$/
     );
     if (!match) return null;
 
     const resourceType = match[1]; // "image" | "video" | "raw"
-    const fullPath = match[2]; // e.g. "chat-app-files/abc.pdf" or "abc.jpg"
+    const fullPath = match[2];
 
-    // For raw resources the extension is part of the public_id
     if (resourceType === "raw") {
-      return { resourceType, publicId: fullPath };
+      // For raw, the extension is part of the public_id
+      const lastDot = fullPath.lastIndexOf(".");
+      return {
+        resourceType,
+        publicId: fullPath,
+        format: lastDot > 0 ? fullPath.substring(lastDot + 1) : "",
+      };
     }
 
-    // For image/video, strip the extension (Cloudinary treats it as "format")
+    // For image/video, strip the extension
     const lastDot = fullPath.lastIndexOf(".");
     if (lastDot > 0) {
       return {
@@ -295,57 +299,90 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
         format: fullPath.substring(lastDot + 1),
       };
     }
-    return { resourceType, publicId: fullPath };
+    return { resourceType, publicId: fullPath, format: "" };
   };
 
-  // ── Helper: generate a Cloudinary *signed* URL with fl_attachment ──
-  const getSignedCloudinaryUrl = (cloudUrl) => {
-    const parsed = parseCloudinaryUrl(cloudUrl);
-    if (!parsed) return null;
-
-    try {
-      const opts = {
-        resource_type: parsed.resourceType,
-        sign_url: true,
-        secure: true,
-        type: "upload",
-        flags: "attachment", // forces download, not browser preview
-      };
-
-      if (parsed.format && parsed.resourceType !== "raw") {
-        opts.format = parsed.format;
-      }
-
-      const signedUrl = cloudinary.url(
-        parsed.resourceType === "raw" ? parsed.publicId : parsed.publicId,
-        opts
-      );
-      console.log("🔑 Generated signed Cloudinary URL:", signedUrl);
-      return signedUrl;
-    } catch (err) {
-      console.error("Failed to generate signed Cloudinary URL:", err.message);
-      return null;
-    }
-  };
-
-  // ── Decide which URL to fetch ──
-  let downloadUrl = url;
+  // ── Build a list of download URLs to try, in priority order ──
+  const urlsToTry = [];
 
   if (url.includes("cloudinary.com") && url.includes("/upload/")) {
-    // Try signed URL first (bypasses 401 strict-transformations)
-    const signed = getSignedCloudinaryUrl(url);
-    if (signed) {
-      downloadUrl = signed;
-    } else {
-      // Fallback: just add fl_attachment to the original URL
-      downloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
+    const parsed = parseCloudinaryUrl(url);
+    console.log("📥 Download request for Cloudinary URL:", { url, fileName, parsed });
+
+    if (parsed && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      // STRATEGY 1: private_download_url — API endpoint, always works
+      try {
+        const apiDownloadUrl = cloudinary.utils.private_download_url(
+          parsed.publicId,
+          parsed.format || "",
+          {
+            resource_type: parsed.resourceType,
+            type: "upload",
+            attachment: true,
+          }
+        );
+        console.log("🔑 Strategy 1 — private_download_url:", apiDownloadUrl);
+        urlsToTry.push(apiDownloadUrl);
+      } catch (e) {
+        console.log("⚠️ private_download_url failed:", e.message);
+      }
+
+      // STRATEGY 2: signed CDN URL (no transformations, just signed)
+      try {
+        const opts = {
+          resource_type: parsed.resourceType,
+          sign_url: true,
+          secure: true,
+          type: "upload",
+        };
+        if (parsed.format && parsed.resourceType !== "raw") {
+          opts.format = parsed.format;
+        }
+        const signedUrl = cloudinary.url(parsed.publicId, opts);
+        console.log("🔑 Strategy 2 — signed CDN URL:", signedUrl);
+        urlsToTry.push(signedUrl);
+      } catch (e) {
+        console.log("⚠️ signed URL failed:", e.message);
+      }
     }
+
+    // STRATEGY 3: fl_attachment on original URL
+    urlsToTry.push(url.replace("/upload/", "/upload/fl_attachment/"));
   }
 
-  // ── Fetch the file, follow redirects, and pipe to client ──
-  const fetchAndStream = (fetchUrl, redirectCount = 0, isRetry = false) => {
+  // STRATEGY 4: the original URL as-is
+  urlsToTry.push(url);
+
+  console.log(`📥 Will try ${urlsToTry.length} URLs for download`);
+
+  // ── Try each URL in order until one works ──
+  let attempt = 0;
+
+  const tryNextUrl = () => {
+    if (attempt >= urlsToTry.length) {
+      if (!res.headersSent) {
+        res.status(502).json({
+          message: "Could not download file from any source. All attempts failed.",
+        });
+      }
+      return;
+    }
+
+    const currentUrl = urlsToTry[attempt];
+    attempt++;
+
+    console.log(`📥 Attempt ${attempt}/${urlsToTry.length}: ${currentUrl.substring(0, 120)}...`);
+
+    fetchAndPipe(currentUrl, 0, () => {
+      // This callback is called on failure — try next URL
+      tryNextUrl();
+    });
+  };
+
+  // ── Fetch a URL, follow redirects, pipe to response ──
+  const fetchAndPipe = (fetchUrl, redirectCount, onFail) => {
     if (redirectCount > 10) {
-      if (!res.headersSent) res.status(500).json({ message: "Too many redirects" });
+      onFail();
       return;
     }
 
@@ -353,7 +390,7 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     try {
       parsedUrl = new URL(fetchUrl);
     } catch (e) {
-      if (!res.headersSent) res.status(400).json({ message: "Invalid URL" });
+      onFail();
       return;
     }
 
@@ -366,32 +403,21 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
         if (loc) {
           fileResponse.resume();
           const abs = loc.startsWith("http") ? loc : new URL(loc, fetchUrl).toString();
-          fetchAndStream(abs, redirectCount + 1, isRetry);
+          fetchAndPipe(abs, redirectCount + 1, onFail);
           return;
         }
       }
 
       if (fileResponse.statusCode !== 200) {
+        console.log(`❌ Attempt returned status ${fileResponse.statusCode}`);
         fileResponse.resume();
-
-        // If the signed / fl_attachment URL failed, retry with the raw original URL
-        if (!isRetry && fetchUrl !== url) {
-          console.log(
-            `⚠️ Download URL returned ${fileResponse.statusCode}, retrying with original URL...`
-          );
-          fetchAndStream(url, 0, true);
-          return;
-        }
-
-        if (!res.headersSent) {
-          res.status(fileResponse.statusCode || 500).json({
-            message: `File not found or unavailable (status: ${fileResponse.statusCode})`,
-          });
-        }
+        onFail();
         return;
       }
 
-      // Content type — prefer our lookup over what the server says
+      // SUCCESS — set headers and pipe the file
+      console.log("✅ Download success, streaming to client...");
+
       const nameBasedType = getContentTypeFromName(fileName);
       const serverType = fileResponse.headers["content-type"] || "";
       const contentType =
@@ -399,7 +425,6 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
           ? nameBasedType
           : serverType || "application/octet-stream";
 
-      // Force-download headers
       res.setHeader("Content-Type", contentType);
       res.setHeader(
         "Content-Disposition",
@@ -419,18 +444,18 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     });
 
     request.on("error", (err) => {
-      console.error("Download proxy error:", err);
-      if (!res.headersSent)
-        res.status(500).json({ message: "Error downloading file: " + err.message });
+      console.error(`Download request error: ${err.message}`);
+      onFail();
     });
 
     request.on("timeout", () => {
       request.destroy();
-      if (!res.headersSent) res.status(504).json({ message: "Download request timed out" });
+      console.log("Download request timed out");
+      onFail();
     });
   };
 
-  fetchAndStream(downloadUrl);
+  tryNextUrl();
 });
 
 //@description     Send Call Record Message

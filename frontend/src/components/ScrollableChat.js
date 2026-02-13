@@ -36,41 +36,37 @@ const triggerBlobDownload = (blob, fileName) => {
 };
 
 // Download file — ALWAYS goes through backend proxy which uses
-// Cloudinary signed URLs (bypasses 401) and forces attachment download.
+// Cloudinary private_download_url API (bypasses 401) and forces attachment download.
 const downloadFile = async (url, fileName) => {
   const safeName = fileName || "download";
 
-  try {
-    const userInfo = JSON.parse(localStorage.getItem("userInfo"));
-    if (!userInfo?.token) throw new Error("Not authenticated");
+  const userInfo = JSON.parse(localStorage.getItem("userInfo"));
+  if (!userInfo?.token) throw new Error("Not authenticated");
 
-    const proxyUrl = `/api/message/download?url=${encodeURIComponent(
-      url
-    )}&name=${encodeURIComponent(safeName)}`;
+  const proxyUrl = `/api/message/download?url=${encodeURIComponent(
+    url
+  )}&name=${encodeURIComponent(safeName)}`;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s timeout
 
-    const response = await fetch(proxyUrl, {
-      headers: { Authorization: `Bearer ${userInfo.token}` },
-      signal: controller.signal,
-    });
+  const response = await fetch(proxyUrl, {
+    headers: { Authorization: `Bearer ${userInfo.token}` },
+    signal: controller.signal,
+  });
 
-    clearTimeout(timeoutId);
+  clearTimeout(timeoutId);
 
-    if (response.ok) {
-      const blob = await response.blob();
-      if (blob.size > 0) {
-        triggerBlobDownload(blob, safeName);
-        return;
-      }
-    }
-    throw new Error(`Server returned status ${response.status}`);
-  } catch (err) {
-    console.error("Download failed:", err.message);
-    // Absolute last resort: open in new tab
-    window.open(url, "_blank");
+  if (!response.ok) {
+    throw new Error(`Download failed (status ${response.status})`);
   }
+
+  const blob = await response.blob();
+  if (blob.size === 0) {
+    throw new Error("Downloaded file is empty");
+  }
+
+  triggerBlobDownload(blob, safeName);
 };
 
 // Location Message Component with Map Preview
@@ -204,13 +200,20 @@ const FileMessage = ({ file, isSender }) => {
 
   if (!file || !file.url) return null;
 
+  const [downloadError, setDownloadError] = useState(false);
+
   const handleDownload = async (e) => {
     e.preventDefault();
     e.stopPropagation();
     if (downloading) return;
     setDownloading(true);
+    setDownloadError(false);
     try {
       await downloadFile(file.url, file.name);
+    } catch (err) {
+      console.error("Download error:", err.message);
+      setDownloadError(true);
+      setTimeout(() => setDownloadError(false), 3000);
     } finally {
       setDownloading(false);
     }
