@@ -315,8 +315,9 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
 
       const uploadConfig = {
         headers: {
-          "Content-Type": "multipart/form-data",
           Authorization: `Bearer ${user.token}`,
+          // DO NOT set Content-Type manually — axios auto-sets it
+          // with the correct multipart boundary when it detects FormData
         },
         onUploadProgress: (progressEvent) => {
           const percentCompleted = Math.round(
