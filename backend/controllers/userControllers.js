@@ -242,6 +242,61 @@ const checkEmail = asyncHandler(async (req, res) => {
   });
 });
 
+//@description     Test email configuration (diagnostic endpoint)
+//@route           GET /api/user/test-email
+//@access          Public (temporary - for debugging)
+const testEmailConfig = asyncHandler(async (req, res) => {
+  const dns = require("dns");
+  const results = {
+    envVars: {
+      EMAIL_USER: process.env.EMAIL_USER ? `${process.env.EMAIL_USER.substring(0, 3)}...` : "NOT SET",
+      EMAIL_PASS: process.env.EMAIL_PASS ? `set (length: ${process.env.EMAIL_PASS.length})` : "NOT SET",
+      FRONTEND_URL: process.env.FRONTEND_URL || "NOT SET",
+      NODE_ENV: process.env.NODE_ENV || "NOT SET",
+    },
+    dns: {},
+    smtpTests: [],
+  };
+
+  // Test DNS resolution
+  try {
+    const addresses = await dns.promises.resolve4("smtp.gmail.com");
+    results.dns = { resolved: true, ips: addresses };
+  } catch (err) {
+    results.dns = { resolved: false, error: err.message };
+  }
+
+  // Test SMTP connections (quick 10s timeout)
+  const net = require("net");
+  const testPort = (host, port) => {
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      const timer = setTimeout(() => {
+        socket.destroy();
+        resolve({ host, port, status: "TIMEOUT (10s)" });
+      }, 10000);
+      socket.connect(port, host, () => {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve({ host, port, status: "CONNECTED ✅" });
+      });
+      socket.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ host, port, status: `ERROR: ${err.message}` });
+      });
+    });
+  };
+
+  // Test connectivity to Gmail SMTP on both ports
+  const hosts = results.dns.resolved ? results.dns.ips : ["smtp.gmail.com"];
+  for (const host of hosts.slice(0, 2)) {
+    results.smtpTests.push(await testPort(host, 587));
+    results.smtpTests.push(await testPort(host, 465));
+  }
+
+  res.json(results);
+});
+
 module.exports = {
   allUsers,
   registerUser,
@@ -249,4 +304,5 @@ module.exports = {
   forgotPassword,
   resetPassword,
   checkEmail,
+  testEmailConfig,
 };

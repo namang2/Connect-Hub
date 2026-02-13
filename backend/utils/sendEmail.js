@@ -1,11 +1,29 @@
 const nodemailer = require("nodemailer");
+const dns = require("dns");
 
-// Try sending email with a specific SMTP configuration
-const trySendWithConfig = async (config, mailOptions) => {
+// Pre-resolve smtp.gmail.com to IPv4 addresses to bypass DNS issues on cloud platforms
+const resolveGmailIPs = async () => {
+  try {
+    const addresses = await dns.promises.resolve4("smtp.gmail.com");
+    console.log("   DNS resolved smtp.gmail.com →", addresses);
+    return addresses;
+  } catch (err) {
+    console.log("   DNS resolution failed, using hostname directly");
+    return ["smtp.gmail.com"];
+  }
+};
+
+// Try sending email with a specific transporter config
+const trySend = async (config, mailOptions, label) => {
+  console.log(`   📤 Trying: ${label}...`);
   const transporter = nodemailer.createTransport(config);
   try {
     const info = await transporter.sendMail(mailOptions);
+    console.log(`   ✅ Success via ${label}! MessageId: ${info.messageId}`);
     return info;
+  } catch (err) {
+    console.log(`   ❌ Failed (${label}): ${err.message} [code: ${err.code}]`);
+    throw err;
   } finally {
     transporter.close();
   }
@@ -14,43 +32,34 @@ const trySendWithConfig = async (config, mailOptions) => {
 const sendEmail = async (options) => {
   console.log("📧 Email sending initiated...");
   console.log(
-    "   EMAIL_USER set:",
-    !!process.env.EMAIL_USER,
+    "   EMAIL_USER:",
     process.env.EMAIL_USER
-      ? `(${process.env.EMAIL_USER.substring(0, 3)}...@${
+      ? `${process.env.EMAIL_USER.substring(0, 3)}...@${
           process.env.EMAIL_USER.split("@")[1] || "?"
-        })`
-      : ""
+        }`
+      : "NOT SET"
   );
   console.log(
-    "   EMAIL_PASS set:",
-    !!process.env.EMAIL_PASS,
-    process.env.EMAIL_PASS ? `(length: ${process.env.EMAIL_PASS.length})` : ""
+    "   EMAIL_PASS:",
+    process.env.EMAIL_PASS
+      ? `set (length: ${process.env.EMAIL_PASS.length})`
+      : "NOT SET"
   );
-  console.log("   NODE_ENV:", process.env.NODE_ENV);
 
-  // Check if email credentials are configured
+  // Check credentials
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.error("❌ EMAIL CONFIGURATION MISSING");
-    console.error("   Set EMAIL_USER and EMAIL_PASS in Render Dashboard");
-
     if (process.env.NODE_ENV !== "production") {
-      console.log("📬 DEV MODE — Logging reset link instead of sending email");
       const linkMatch = options.html.match(
         /href="([^"]*reset-password[^"]*)"/
       );
-      if (linkMatch) {
-        console.log("🔗 Reset Link: " + linkMatch[1]);
-      }
+      if (linkMatch) console.log("🔗 DEV Reset Link: " + linkMatch[1]);
       return { success: true, devMode: true };
     }
-
     throw new Error(
       "Email credentials not configured. Add EMAIL_USER and EMAIL_PASS in Render environment variables."
     );
   }
 
-  // Clean the app password (remove any spaces from copy-paste)
   const emailUser = process.env.EMAIL_USER.trim();
   const emailPass = process.env.EMAIL_PASS.replace(/\s/g, "");
 
@@ -61,101 +70,86 @@ const sendEmail = async (options) => {
     html: options.html,
   };
 
-  // SMTP configurations to try (in order)
-  // Config 1: Port 587 with STARTTLS (recommended by Google, works on most cloud platforms)
-  // Config 2: Port 465 with SSL (direct SSL connection)
-  // Config 3: Using "gmail" service shorthand (Google's recommended settings)
-  const smtpConfigs = [
-    {
-      name: "Gmail Port 587 (STARTTLS)",
-      host: "smtp.gmail.com",
-      port: 587,
-      secure: false,
-      auth: { user: emailUser, pass: emailPass },
-      tls: { rejectUnauthorized: false, minVersion: "TLSv1.2" },
-      connectionTimeout: 120000,
-      greetingTimeout: 60000,
-      socketTimeout: 120000,
-    },
-    {
-      name: "Gmail Port 465 (SSL)",
-      host: "smtp.gmail.com",
-      port: 465,
-      secure: true,
-      auth: { user: emailUser, pass: emailPass },
-      tls: { rejectUnauthorized: false },
-      connectionTimeout: 120000,
-      greetingTimeout: 60000,
-      socketTimeout: 120000,
-    },
-    {
-      name: "Gmail Service (auto-config)",
+  // Resolve Gmail SMTP IPs (bypasses slow/broken DNS on some cloud platforms)
+  const gmailIPs = await resolveGmailIPs();
+
+  // Build a list of configurations to try
+  // Each combines: an IP/host × a port × SSL/TLS setting
+  const configs = [];
+
+  for (const host of gmailIPs) {
+    const isIP = host !== "smtp.gmail.com";
+    const tlsOpts = isIP
+      ? { servername: "smtp.gmail.com", rejectUnauthorized: false }
+      : { rejectUnauthorized: false };
+
+    // Port 587 STARTTLS (most commonly recommended by Google)
+    configs.push({
+      label: `${host}:587 STARTTLS`,
+      config: {
+        host,
+        port: 587,
+        secure: false,
+        auth: { user: emailUser, pass: emailPass },
+        tls: tlsOpts,
+        connectionTimeout: 30000,
+        greetingTimeout: 20000,
+        socketTimeout: 60000,
+      },
+    });
+
+    // Port 465 SSL (direct SSL connection)
+    configs.push({
+      label: `${host}:465 SSL`,
+      config: {
+        host,
+        port: 465,
+        secure: true,
+        auth: { user: emailUser, pass: emailPass },
+        tls: tlsOpts,
+        connectionTimeout: 30000,
+        greetingTimeout: 20000,
+        socketTimeout: 60000,
+      },
+    });
+  }
+
+  // Also try the "gmail" service shorthand (uses Google's preset config)
+  configs.push({
+    label: "service:gmail",
+    config: {
       service: "gmail",
       auth: { user: emailUser, pass: emailPass },
       tls: { rejectUnauthorized: false },
-      connectionTimeout: 120000,
-      greetingTimeout: 60000,
-      socketTimeout: 120000,
+      connectionTimeout: 30000,
+      greetingTimeout: 20000,
+      socketTimeout: 60000,
     },
-  ];
+  });
 
+  // Try each config. Stop on first success.
   let lastError = null;
-
-  for (const config of smtpConfigs) {
-    const configName = config.name;
-    delete config.name; // Remove our custom field before passing to nodemailer
-
-    // Try up to 2 attempts per configuration
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(`📤 Trying ${configName} (attempt ${attempt}/2)...`);
-        const info = await trySendWithConfig(config, mailOptions);
-        console.log(
-          `✅ Email sent via ${configName}! MessageId: ${info.messageId}`
+  for (const { label, config } of configs) {
+    try {
+      const info = await trySend(config, mailOptions, label);
+      return info;
+    } catch (err) {
+      lastError = err;
+      // Auth error = credentials wrong, no point trying other ports/IPs
+      if (err.code === "EAUTH" || err.responseCode === 535) {
+        throw new Error(
+          "Gmail authentication failed. EMAIL_PASS must be a 16-character App Password (not your Gmail password). " +
+            "Enable 2-Step Verification at myaccount.google.com/security, then create an App Password."
         );
-        return info;
-      } catch (err) {
-        lastError = err;
-        console.log(
-          `❌ ${configName} attempt ${attempt} failed: ${err.message}`
-        );
-
-        // If it's an authentication error, don't retry with same config
-        if (err.code === "EAUTH" || err.responseCode === 535) {
-          console.error(
-            "🔑 Authentication error — EMAIL_USER or EMAIL_PASS is incorrect"
-          );
-          console.error(
-            "   Make sure EMAIL_PASS is a 16-character Gmail App Password (no spaces)"
-          );
-          break; // Skip to next config
-        }
-
-        // Wait before retrying
-        if (attempt < 2) {
-          console.log("   ⏳ Waiting 5s before retry...");
-          await new Promise((r) => setTimeout(r, 5000));
-        }
       }
     }
   }
 
-  // All configurations failed
-  console.error("❌ ALL email configurations failed!");
-  console.error("   Last error:", lastError?.message);
-  console.error("   Possible causes:");
-  console.error(
-    "   1. EMAIL_PASS is wrong (must be 16-char Gmail App Password, not your Gmail password)"
-  );
-  console.error(
-    "   2. 2-Step Verification is not enabled on the Gmail account"
-  );
-  console.error("   3. The hosting platform may be blocking SMTP connections");
-
+  // Every config failed
+  console.error("❌ ALL email send attempts failed");
   throw new Error(
-    lastError?.code === "EAUTH" || lastError?.responseCode === 535
-      ? "Gmail authentication failed. Make sure EMAIL_PASS is a 16-character App Password (not your regular Gmail password). Enable 2-Step Verification first at myaccount.google.com/security."
-      : `Unable to send email. All SMTP configurations failed. Last error: ${lastError?.message}`
+    `Unable to send email — all SMTP connections failed. Last error: ${lastError?.message}. ` +
+      "This is likely a network restriction on the hosting platform."
   );
 };
 
@@ -180,7 +174,6 @@ const getPasswordResetEmailTemplate = (userName, resetUrl) => {
                   <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0; font-size: 16px;">Password Reset Request</p>
                 </td>
               </tr>
-              
               <!-- Content -->
               <tr>
                 <td style="padding: 40px 30px;">
@@ -188,8 +181,6 @@ const getPasswordResetEmailTemplate = (userName, resetUrl) => {
                   <p style="color: #666; line-height: 1.6; margin: 0 0 20px 0; font-size: 16px;">
                     We received a request to reset your password. Click the button below to create a new password:
                   </p>
-                  
-                  <!-- Button -->
                   <table width="100%" cellpadding="0" cellspacing="0">
                     <tr>
                       <td align="center" style="padding: 30px 0;">
@@ -199,25 +190,18 @@ const getPasswordResetEmailTemplate = (userName, resetUrl) => {
                       </td>
                     </tr>
                   </table>
-                  
                   <p style="color: #999; font-size: 14px; line-height: 1.6; margin: 20px 0 0 0;">
                     ⏰ This link will expire in <strong>15 minutes</strong> for security reasons.
                   </p>
                   <p style="color: #999; font-size: 14px; line-height: 1.6; margin: 10px 0 0 0;">
-                    If you didn't request this password reset, please ignore this email or contact support if you have concerns.
+                    If you didn't request this, please ignore this email.
                   </p>
                 </td>
               </tr>
-              
               <!-- Footer -->
               <tr>
                 <td style="background: #f8f9fa; padding: 30px; text-align: center; border-top: 1px solid #eee;">
-                  <p style="color: #999; font-size: 14px; margin: 0;">
-                    Made with 💜 by Connect Hub Team
-                  </p>
-                  <p style="color: #ccc; font-size: 12px; margin: 10px 0 0 0;">
-                    © 2024 Connect Hub. All rights reserved.
-                  </p>
+                  <p style="color: #999; font-size: 14px; margin: 0;">Made with 💜 by Connect Hub Team</p>
                 </td>
               </tr>
             </table>
@@ -230,4 +214,3 @@ const getPasswordResetEmailTemplate = (userName, resetUrl) => {
 };
 
 module.exports = { sendEmail, getPasswordResetEmailTemplate };
-
