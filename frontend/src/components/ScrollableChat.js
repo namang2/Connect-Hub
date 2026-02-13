@@ -19,44 +19,38 @@ const formatFileSize = (bytes) => {
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 };
 
+// Helper: trigger download from a blob
+const triggerBlobDownload = (blob, fileName) => {
+  const blobUrl = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = fileName;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => {
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(blobUrl);
+  }, 500);
+};
+
+// Helper: check if a Cloudinary URL is for image or video
+const isCloudinaryImageOrVideo = (url) => {
+  if (!url || !url.includes("cloudinary.com")) return false;
+  return url.includes("/image/upload") || url.includes("/video/upload");
+};
+
 // Helper function to download file - uses multiple strategies for reliability
 const downloadFile = async (url, fileName) => {
-  const safeName = fileName || 'download';
-  
-  // Strategy 1: For Cloudinary URLs, modify URL to force download (fl_attachment)
-  if (url && url.includes('cloudinary.com')) {
-    try {
-      // Add fl_attachment to Cloudinary URL to force download
-      const cloudinaryDownloadUrl = url.includes('/upload/')
-        ? url.replace('/upload/', '/upload/fl_attachment/')
-        : url;
-      
-      const response = await fetch(cloudinaryDownloadUrl);
-      if (response.ok) {
-        const blob = await response.blob();
-        const blobUrl = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.download = safeName;
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        setTimeout(() => {
-          document.body.removeChild(link);
-          window.URL.revokeObjectURL(blobUrl);
-        }, 300);
-        return;
-      }
-    } catch (cloudErr) {
-      console.log('Cloudinary direct download failed, trying proxy...');
-    }
-  }
+  const safeName = fileName || "download";
 
-  // Strategy 2: Use backend proxy endpoint
+  // ===== STRATEGY 1: Backend proxy (most reliable — works for ALL file types) =====
   try {
     const userInfo = JSON.parse(localStorage.getItem("userInfo"));
-    const proxyUrl = `/api/message/download?url=${encodeURIComponent(url)}&name=${encodeURIComponent(safeName)}`;
-    
+    const proxyUrl = `/api/message/download?url=${encodeURIComponent(
+      url
+    )}&name=${encodeURIComponent(safeName)}`;
+
     const response = await fetch(proxyUrl, {
       headers: {
         Authorization: `Bearer ${userInfo?.token}`,
@@ -65,58 +59,60 @@ const downloadFile = async (url, fileName) => {
 
     if (response.ok) {
       const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = safeName;
-      link.style.display = 'none';
-      document.body.appendChild(link);
-      link.click();
-      setTimeout(() => {
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(blobUrl);
-      }, 300);
-      return;
+      if (blob.size > 0) {
+        triggerBlobDownload(blob, safeName);
+        return;
+      }
     }
+    console.log("Proxy download: response not ok or empty, trying next strategy...");
   } catch (proxyErr) {
-    console.log('Proxy download failed, trying direct...');
+    console.log("Proxy download failed:", proxyErr.message);
   }
 
-  // Strategy 3: Direct fetch from original URL
+  // ===== STRATEGY 2: Cloudinary fl_attachment (only for image/video, NOT raw) =====
+  if (isCloudinaryImageOrVideo(url)) {
+    try {
+      const cloudinaryDownloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
+      const response = await fetch(cloudinaryDownloadUrl);
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.size > 0) {
+          triggerBlobDownload(blob, safeName);
+          return;
+        }
+      }
+    } catch (cloudErr) {
+      console.log("Cloudinary fl_attachment failed:", cloudErr.message);
+    }
+  }
+
+  // ===== STRATEGY 3: Direct fetch (may work if CORS allows) =====
   try {
-    const directResponse = await fetch(url, { mode: 'cors' });
+    const directResponse = await fetch(url, { mode: "cors" });
     if (directResponse.ok) {
       const blob = await directResponse.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = safeName;
-      link.style.display = 'none';
-      document.body.appendChild(link);
-      link.click();
-      setTimeout(() => {
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(blobUrl);
-      }, 300);
-      return;
+      if (blob.size > 0) {
+        triggerBlobDownload(blob, safeName);
+        return;
+      }
     }
   } catch (directErr) {
-    console.log('Direct fetch failed');
+    console.log("Direct fetch failed:", directErr.message);
   }
 
-  // Strategy 4: Use anchor tag with download attribute
+  // ===== STRATEGY 4: Anchor tag with download attribute =====
   try {
-    const link = document.createElement('a');
+    const link = document.createElement("a");
     link.href = url;
     link.download = safeName;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
     document.body.appendChild(link);
     link.click();
-    setTimeout(() => document.body.removeChild(link), 300);
+    setTimeout(() => document.body.removeChild(link), 500);
   } catch (err) {
-    // Last fallback: open in new tab
-    window.open(url, '_blank');
+    // Last resort: open in new tab
+    window.open(url, "_blank");
   }
 };
 

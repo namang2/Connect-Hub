@@ -314,8 +314,10 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
       data.append("cloud_name", "dejog9zgj");
 
       // Determine resource type based on file
-      let resourceType = "auto";
-      if (file.type.startsWith("video/")) {
+      // Cloudinary requires correct resource_type:
+      //   "image" for images, "video" for video/audio, "raw" for everything else (PDF, docs, etc.)
+      let resourceType = "raw";
+      if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
         resourceType = "video";
       } else if (file.type.startsWith("image/")) {
         resourceType = "image";

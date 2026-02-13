@@ -226,63 +226,149 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
     throw new Error("File URL is required");
   }
 
+  // Determine correct content-type from file extension
+  const getContentTypeFromName = (fileName) => {
+    const ext = (fileName || "").split(".").pop().toLowerCase();
+    const mimeTypes = {
+      pdf: "application/pdf",
+      doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      xls: "application/vnd.ms-excel",
+      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ppt: "application/vnd.ms-powerpoint",
+      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      txt: "text/plain",
+      csv: "text/csv",
+      zip: "application/zip",
+      rar: "application/x-rar-compressed",
+      "7z": "application/x-7z-compressed",
+      mp3: "audio/mpeg",
+      wav: "audio/wav",
+      mp4: "video/mp4",
+      avi: "video/x-msvideo",
+      mov: "video/quicktime",
+      mkv: "video/x-matroska",
+      webm: "video/webm",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      gif: "image/gif",
+      webp: "image/webp",
+      svg: "image/svg+xml",
+      json: "application/json",
+      xml: "application/xml",
+      html: "text/html",
+      css: "text/css",
+      js: "application/javascript",
+    };
+    return mimeTypes[ext] || "application/octet-stream";
+  };
+
   try {
     const https = require("https");
     const http = require("http");
 
-    // Recursive function to follow redirects (up to 5 levels)
+    const fileName = name || "download";
+
+    // Recursive function to follow redirects (up to 10 levels)
     const fetchWithRedirects = (fetchUrl, redirectCount = 0) => {
-      if (redirectCount > 5) {
-        res.status(500).json({ message: "Too many redirects" });
+      if (redirectCount > 10) {
+        if (!res.headersSent) {
+          res.status(500).json({ message: "Too many redirects" });
+        }
         return;
       }
 
-      const parsedUrl = new URL(fetchUrl);
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(fetchUrl);
+      } catch (e) {
+        if (!res.headersSent) {
+          res.status(400).json({ message: "Invalid URL" });
+        }
+        return;
+      }
+
       const protocol = parsedUrl.protocol === "https:" ? https : http;
 
-      protocol.get(fetchUrl, (fileResponse) => {
+      const request = protocol.get(fetchUrl, { timeout: 30000 }, (fileResponse) => {
         // Follow redirects
         if ([301, 302, 303, 307, 308].includes(fileResponse.statusCode)) {
           const redirectUrl = fileResponse.headers.location;
           if (redirectUrl) {
-            // Handle relative URLs
-            const absoluteUrl = redirectUrl.startsWith("http") 
-              ? redirectUrl 
+            const absoluteUrl = redirectUrl.startsWith("http")
+              ? redirectUrl
               : new URL(redirectUrl, fetchUrl).toString();
+            // Consume the redirect response to free up the socket
+            fileResponse.resume();
             fetchWithRedirects(absoluteUrl, redirectCount + 1);
             return;
           }
         }
 
         if (fileResponse.statusCode !== 200) {
-          res.status(fileResponse.statusCode || 500).json({ message: "File not found or unavailable" });
+          // Consume response to free socket
+          fileResponse.resume();
+          if (!res.headersSent) {
+            res.status(fileResponse.statusCode || 500).json({
+              message: `File not found or unavailable (status: ${fileResponse.statusCode})`,
+            });
+          }
           return;
         }
 
-        const contentType = fileResponse.headers["content-type"] || "application/octet-stream";
-        const fileName = name || "download";
-        
-        // Set proper download headers
+        // Determine content type - prefer our lookup over server's response
+        // because Cloudinary raw URLs often return 'application/octet-stream'
+        const serverContentType = fileResponse.headers["content-type"] || "";
+        const contentType =
+          serverContentType && serverContentType !== "application/octet-stream"
+            ? serverContentType
+            : getContentTypeFromName(fileName);
+
+        // Set download headers
         res.setHeader("Content-Type", contentType);
-        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(fileName)}"`);
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${encodeURIComponent(fileName)}"`
+        );
         res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
         if (fileResponse.headers["content-length"]) {
           res.setHeader("Content-Length", fileResponse.headers["content-length"]);
         }
-        
+
+        // Pipe the file data to the response
         fileResponse.pipe(res);
-      }).on("error", (err) => {
-        console.error("Download proxy error:", err);
+
+        // Handle pipe errors
+        fileResponse.on("error", (err) => {
+          console.error("Download stream error:", err);
+          if (!res.headersSent) {
+            res.status(500).json({ message: "Error streaming file" });
+          }
+        });
+      });
+
+      request.on("error", (err) => {
+        console.error("Download proxy request error:", err);
         if (!res.headersSent) {
-          res.status(500).json({ message: "Error downloading file" });
+          res.status(500).json({ message: "Error downloading file: " + err.message });
+        }
+      });
+
+      request.on("timeout", () => {
+        request.destroy();
+        if (!res.headersSent) {
+          res.status(504).json({ message: "Download request timed out" });
         }
       });
     };
 
     fetchWithRedirects(url);
   } catch (error) {
-    res.status(500);
-    throw new Error("Error downloading file: " + error.message);
+    console.error("Download proxy error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Error downloading file: " + error.message });
+    }
   }
 });
 
