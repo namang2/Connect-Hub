@@ -1,10 +1,50 @@
 const nodemailer = require("nodemailer");
 
+// Create reusable transporter - created once, reused across calls
+let cachedTransporter = null;
+
+const createTransporter = () => {
+  if (cachedTransporter) return cachedTransporter;
+
+  cachedTransporter = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true, // SSL on port 465
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+    tls: {
+      rejectUnauthorized: false,
+    },
+    // Generous timeouts for cloud hosting (Render, etc.)
+    connectionTimeout: 60000, // 60 seconds
+    greetingTimeout: 60000, // 60 seconds
+    socketTimeout: 120000, // 120 seconds
+    pool: true, // use connection pooling
+    maxConnections: 3,
+    maxMessages: 100,
+  });
+
+  return cachedTransporter;
+};
+
 const sendEmail = async (options) => {
-  // Debug: Log environment variable status (not values for security)
   console.log("📧 Email sending initiated...");
-  console.log("   EMAIL_USER set:", !!process.env.EMAIL_USER, process.env.EMAIL_USER ? `(${process.env.EMAIL_USER.substring(0, 3)}...@${process.env.EMAIL_USER.split("@")[1] || "?"})` : "");
-  console.log("   EMAIL_PASS set:", !!process.env.EMAIL_PASS, process.env.EMAIL_PASS ? `(length: ${process.env.EMAIL_PASS.length})` : "");
+  console.log(
+    "   EMAIL_USER set:",
+    !!process.env.EMAIL_USER,
+    process.env.EMAIL_USER
+      ? `(${process.env.EMAIL_USER.substring(0, 3)}...@${
+          process.env.EMAIL_USER.split("@")[1] || "?"
+        })`
+      : ""
+  );
+  console.log(
+    "   EMAIL_PASS set:",
+    !!process.env.EMAIL_PASS,
+    process.env.EMAIL_PASS ? `(length: ${process.env.EMAIL_PASS.length})` : ""
+  );
   console.log("   NODE_ENV:", process.env.NODE_ENV);
   console.log("   FRONTEND_URL:", process.env.FRONTEND_URL || "NOT SET");
 
@@ -26,7 +66,9 @@ const sendEmail = async (options) => {
       console.log("📬 Password Reset Link (DEV MODE):");
       console.log(`   Email: ${options.email}`);
       console.log(`   Subject: ${options.subject}`);
-      const linkMatch = options.html.match(/href="([^"]*reset-password[^"]*)"/);
+      const linkMatch = options.html.match(
+        /href="([^"]*reset-password[^"]*)"/
+      );
       if (linkMatch) {
         console.log("🔗 Reset Link: " + linkMatch[1]);
       }
@@ -39,34 +81,19 @@ const sendEmail = async (options) => {
     );
   }
 
-  // Create transporter with Gmail SMTP
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
-    },
-    tls: {
-      rejectUnauthorized: false,
-    },
-  });
-
-  // Verify connection before sending
-  try {
-    await transporter.verify();
-    console.log("✅ Email transporter verified successfully");
-  } catch (verifyError) {
-    console.error("❌ Email transporter verification FAILED!");
-    console.error("   Error:", verifyError.message);
-    console.error("   Code:", verifyError.code);
-    console.error("   This usually means:");
-    console.error("   1. EMAIL_USER is not a valid Gmail address");
-    console.error("   2. EMAIL_PASS is not a valid App Password (must be 16 chars, no spaces)");
-    console.error("   3. 2-Step Verification is not enabled on the Gmail account");
-    throw new Error(
-      `Gmail authentication failed. Please check your EMAIL_USER and EMAIL_PASS. Error: ${verifyError.message}`
+  // Trim any spaces from EMAIL_PASS (common copy-paste issue)
+  const cleanPass = process.env.EMAIL_PASS.replace(/\s/g, "");
+  if (cleanPass !== process.env.EMAIL_PASS) {
+    console.log(
+      "⚠️ EMAIL_PASS had spaces — using trimmed version (length:",
+      cleanPass.length,
+      ")"
     );
+    process.env.EMAIL_PASS = cleanPass;
+    cachedTransporter = null; // Force recreate transporter with clean password
   }
+
+  const transporter = createTransporter();
 
   // Email options
   const mailOptions = {
@@ -76,17 +103,67 @@ const sendEmail = async (options) => {
     html: options.html,
   };
 
-  // Send email
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log("✅ Email sent successfully to:", options.email, "MessageId:", info.messageId);
-    return info;
-  } catch (sendError) {
-    console.error("❌ Email sending FAILED!");
-    console.error("   Error:", sendError.message);
-    console.error("   Code:", sendError.code);
-    throw new Error(`Failed to send email: ${sendError.message}`);
+  // Retry logic — try up to 3 times with increasing delay
+  const maxRetries = 3;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(
+        `📤 Sending email attempt ${attempt}/${maxRetries} to: ${options.email}`
+      );
+      const info = await transporter.sendMail(mailOptions);
+      console.log(
+        "✅ Email sent successfully to:",
+        options.email,
+        "MessageId:",
+        info.messageId
+      );
+      return info;
+    } catch (sendError) {
+      lastError = sendError;
+      console.error(
+        `❌ Email attempt ${attempt}/${maxRetries} failed:`,
+        sendError.message
+      );
+      console.error("   Error code:", sendError.code);
+
+      // If it's an auth error, don't retry (wrong credentials)
+      if (
+        sendError.code === "EAUTH" ||
+        sendError.responseCode === 535
+      ) {
+        console.error(
+          "🔑 Authentication error — check EMAIL_USER and EMAIL_PASS"
+        );
+        // Reset cached transporter so next attempt creates fresh one
+        cachedTransporter = null;
+        throw new Error(
+          "Gmail authentication failed. Please verify your EMAIL_USER and EMAIL_PASS (must be a 16-character App Password with no spaces)."
+        );
+      }
+
+      // For timeout/connection errors, retry
+      if (attempt < maxRetries) {
+        const delay = attempt * 5000; // 5s, 10s, 15s
+        console.log(`⏳ Retrying in ${delay / 1000}s...`);
+        // Reset cached transporter to create fresh connection
+        cachedTransporter = null;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
   }
+
+  // All retries failed
+  console.error("❌ All email send attempts failed!");
+  console.error("   Last error:", lastError?.message);
+  
+  // Reset transporter for next time
+  cachedTransporter = null;
+
+  throw new Error(
+    `Failed to send email after ${maxRetries} attempts. Error: ${lastError?.message}. This may be a network issue on the hosting platform.`
+  );
 };
 
 // Password reset email template
