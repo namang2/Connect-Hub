@@ -34,43 +34,50 @@ const triggerBlobDownload = (blob, fileName) => {
   }, 500);
 };
 
-// Helper: check if a Cloudinary URL is for image or video
-const isCloudinaryImageOrVideo = (url) => {
-  if (!url || !url.includes("cloudinary.com")) return false;
-  return url.includes("/image/upload") || url.includes("/video/upload");
-};
-
 // Helper function to download file - uses multiple strategies for reliability
 const downloadFile = async (url, fileName) => {
   const safeName = fileName || "download";
 
   // ===== STRATEGY 1: Backend proxy (most reliable — works for ALL file types) =====
+  // The proxy handles fl_attachment for Cloudinary docs, correct content-type, and CORS
   try {
     const userInfo = JSON.parse(localStorage.getItem("userInfo"));
-    const proxyUrl = `/api/message/download?url=${encodeURIComponent(
-      url
-    )}&name=${encodeURIComponent(safeName)}`;
+    if (userInfo?.token) {
+      const proxyUrl = `/api/message/download?url=${encodeURIComponent(
+        url
+      )}&name=${encodeURIComponent(safeName)}`;
 
-    const response = await fetch(proxyUrl, {
-      headers: {
-        Authorization: `Bearer ${userInfo?.token}`,
-      },
-    });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
 
-    if (response.ok) {
-      const blob = await response.blob();
-      if (blob.size > 0) {
-        triggerBlobDownload(blob, safeName);
-        return;
+      const response = await fetch(proxyUrl, {
+        headers: {
+          Authorization: `Bearer ${userInfo.token}`,
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.size > 0) {
+          triggerBlobDownload(blob, safeName);
+          return;
+        }
       }
+      console.log("Proxy download: status", response.status, "- trying next strategy...");
     }
-    console.log("Proxy download: response not ok or empty, trying next strategy...");
   } catch (proxyErr) {
-    console.log("Proxy download failed:", proxyErr.message);
+    if (proxyErr.name === "AbortError") {
+      console.log("Proxy download timed out, trying next strategy...");
+    } else {
+      console.log("Proxy download failed:", proxyErr.message);
+    }
   }
 
-  // ===== STRATEGY 2: Cloudinary fl_attachment (only for image/video, NOT raw) =====
-  if (isCloudinaryImageOrVideo(url)) {
+  // ===== STRATEGY 2: Cloudinary fl_attachment (for image/video Cloudinary URLs) =====
+  if (url && url.includes("cloudinary.com") && url.includes("/upload/")) {
     try {
       const cloudinaryDownloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
       const response = await fetch(cloudinaryDownloadUrl);

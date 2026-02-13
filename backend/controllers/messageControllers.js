@@ -270,8 +270,22 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
 
     const fileName = name || "download";
 
+    // Transform Cloudinary URL to ensure we get the original file
+    // PDFs stored as "image" type need fl_attachment to return original PDF
+    let downloadUrl = url;
+    if (url.includes("cloudinary.com") && url.includes("/upload/")) {
+      const fileExt = (fileName || url).split(".").pop().toLowerCase();
+      const isDocument = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "rar", "7z"].includes(fileExt);
+
+      if (isDocument && !url.includes("fl_attachment")) {
+        // Add fl_attachment to force original file delivery (not rasterized image)
+        downloadUrl = url.replace("/upload/", "/upload/fl_attachment/");
+        console.log("📎 Transformed Cloudinary URL for document download:", downloadUrl);
+      }
+    }
+
     // Recursive function to follow redirects (up to 10 levels)
-    const fetchWithRedirects = (fetchUrl, redirectCount = 0) => {
+    const fetchWithRedirects = (fetchUrl, redirectCount = 0, isRetryWithOriginal = false) => {
       if (redirectCount > 10) {
         if (!res.headersSent) {
           res.status(500).json({ message: "Too many redirects" });
@@ -309,6 +323,14 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
         if (fileResponse.statusCode !== 200) {
           // Consume response to free socket
           fileResponse.resume();
+
+          // If fl_attachment URL failed, retry with original URL
+          if (!isRetryWithOriginal && fetchUrl !== url) {
+            console.log(`📎 fl_attachment URL returned ${fileResponse.statusCode}, retrying with original URL...`);
+            fetchWithRedirects(url, 0, true);
+            return;
+          }
+
           if (!res.headersSent) {
             res.status(fileResponse.statusCode || 500).json({
               message: `File not found or unavailable (status: ${fileResponse.statusCode})`,
@@ -317,13 +339,15 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
           return;
         }
 
-        // Determine content type - prefer our lookup over server's response
-        // because Cloudinary raw URLs often return 'application/octet-stream'
+        // Determine content type from file name (most reliable)
+        // Cloudinary often returns wrong content-type for documents (e.g. image/png for PDFs)
+        const nameBasedType = getContentTypeFromName(fileName);
         const serverContentType = fileResponse.headers["content-type"] || "";
+        // Use name-based type if it's specific, otherwise use server's response
         const contentType =
-          serverContentType && serverContentType !== "application/octet-stream"
-            ? serverContentType
-            : getContentTypeFromName(fileName);
+          nameBasedType !== "application/octet-stream"
+            ? nameBasedType
+            : serverContentType || "application/octet-stream";
 
         // Set download headers
         res.setHeader("Content-Type", contentType);
@@ -363,7 +387,7 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
       });
     };
 
-    fetchWithRedirects(url);
+    fetchWithRedirects(downloadUrl);
   } catch (error) {
     console.error("Download proxy error:", error);
     if (!res.headersSent) {

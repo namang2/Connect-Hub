@@ -1,32 +1,14 @@
 const nodemailer = require("nodemailer");
 
-// Create reusable transporter - created once, reused across calls
-let cachedTransporter = null;
-
-const createTransporter = () => {
-  if (cachedTransporter) return cachedTransporter;
-
-  cachedTransporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true, // SSL on port 465
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
-    },
-    tls: {
-      rejectUnauthorized: false,
-    },
-    // Generous timeouts for cloud hosting (Render, etc.)
-    connectionTimeout: 60000, // 60 seconds
-    greetingTimeout: 60000, // 60 seconds
-    socketTimeout: 120000, // 120 seconds
-    pool: true, // use connection pooling
-    maxConnections: 3,
-    maxMessages: 100,
-  });
-
-  return cachedTransporter;
+// Try sending email with a specific SMTP configuration
+const trySendWithConfig = async (config, mailOptions) => {
+  const transporter = nodemailer.createTransport(config);
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    return info;
+  } finally {
+    transporter.close();
+  }
 };
 
 const sendEmail = async (options) => {
@@ -46,123 +28,134 @@ const sendEmail = async (options) => {
     process.env.EMAIL_PASS ? `(length: ${process.env.EMAIL_PASS.length})` : ""
   );
   console.log("   NODE_ENV:", process.env.NODE_ENV);
-  console.log("   FRONTEND_URL:", process.env.FRONTEND_URL || "NOT SET");
 
   // Check if email credentials are configured
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.error("=================================================");
     console.error("❌ EMAIL CONFIGURATION MISSING");
-    console.error("=================================================");
-    console.error("EMAIL_USER exists:", !!process.env.EMAIL_USER);
-    console.error("EMAIL_PASS exists:", !!process.env.EMAIL_PASS);
-    console.error("Make sure these env vars are set in Render Dashboard:");
-    console.error("  EMAIL_USER=your_gmail@gmail.com");
-    console.error("  EMAIL_PASS=your_16_char_app_password");
-    console.error("=================================================");
+    console.error("   Set EMAIL_USER and EMAIL_PASS in Render Dashboard");
 
-    // In development, log the reset link for testing
     if (process.env.NODE_ENV !== "production") {
-      console.log("");
-      console.log("📬 Password Reset Link (DEV MODE):");
-      console.log(`   Email: ${options.email}`);
-      console.log(`   Subject: ${options.subject}`);
+      console.log("📬 DEV MODE — Logging reset link instead of sending email");
       const linkMatch = options.html.match(
         /href="([^"]*reset-password[^"]*)"/
       );
       if (linkMatch) {
         console.log("🔗 Reset Link: " + linkMatch[1]);
       }
-      console.log("=================================================");
       return { success: true, devMode: true };
     }
 
     throw new Error(
-      "Email credentials (EMAIL_USER / EMAIL_PASS) are not configured on the server. Please add them in Render environment variables."
+      "Email credentials not configured. Add EMAIL_USER and EMAIL_PASS in Render environment variables."
     );
   }
 
-  // Trim any spaces from EMAIL_PASS (common copy-paste issue)
-  const cleanPass = process.env.EMAIL_PASS.replace(/\s/g, "");
-  if (cleanPass !== process.env.EMAIL_PASS) {
-    console.log(
-      "⚠️ EMAIL_PASS had spaces — using trimmed version (length:",
-      cleanPass.length,
-      ")"
-    );
-    process.env.EMAIL_PASS = cleanPass;
-    cachedTransporter = null; // Force recreate transporter with clean password
-  }
+  // Clean the app password (remove any spaces from copy-paste)
+  const emailUser = process.env.EMAIL_USER.trim();
+  const emailPass = process.env.EMAIL_PASS.replace(/\s/g, "");
 
-  const transporter = createTransporter();
-
-  // Email options
   const mailOptions = {
-    from: `"Connect Hub" <${process.env.EMAIL_USER}>`,
+    from: `"Connect Hub" <${emailUser}>`,
     to: options.email,
     subject: options.subject,
     html: options.html,
   };
 
-  // Retry logic — try up to 3 times with increasing delay
-  const maxRetries = 3;
+  // SMTP configurations to try (in order)
+  // Config 1: Port 587 with STARTTLS (recommended by Google, works on most cloud platforms)
+  // Config 2: Port 465 with SSL (direct SSL connection)
+  // Config 3: Using "gmail" service shorthand (Google's recommended settings)
+  const smtpConfigs = [
+    {
+      name: "Gmail Port 587 (STARTTLS)",
+      host: "smtp.gmail.com",
+      port: 587,
+      secure: false,
+      auth: { user: emailUser, pass: emailPass },
+      tls: { rejectUnauthorized: false, minVersion: "TLSv1.2" },
+      connectionTimeout: 120000,
+      greetingTimeout: 60000,
+      socketTimeout: 120000,
+    },
+    {
+      name: "Gmail Port 465 (SSL)",
+      host: "smtp.gmail.com",
+      port: 465,
+      secure: true,
+      auth: { user: emailUser, pass: emailPass },
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 120000,
+      greetingTimeout: 60000,
+      socketTimeout: 120000,
+    },
+    {
+      name: "Gmail Service (auto-config)",
+      service: "gmail",
+      auth: { user: emailUser, pass: emailPass },
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 120000,
+      greetingTimeout: 60000,
+      socketTimeout: 120000,
+    },
+  ];
+
   let lastError = null;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(
-        `📤 Sending email attempt ${attempt}/${maxRetries} to: ${options.email}`
-      );
-      const info = await transporter.sendMail(mailOptions);
-      console.log(
-        "✅ Email sent successfully to:",
-        options.email,
-        "MessageId:",
-        info.messageId
-      );
-      return info;
-    } catch (sendError) {
-      lastError = sendError;
-      console.error(
-        `❌ Email attempt ${attempt}/${maxRetries} failed:`,
-        sendError.message
-      );
-      console.error("   Error code:", sendError.code);
+  for (const config of smtpConfigs) {
+    const configName = config.name;
+    delete config.name; // Remove our custom field before passing to nodemailer
 
-      // If it's an auth error, don't retry (wrong credentials)
-      if (
-        sendError.code === "EAUTH" ||
-        sendError.responseCode === 535
-      ) {
-        console.error(
-          "🔑 Authentication error — check EMAIL_USER and EMAIL_PASS"
+    // Try up to 2 attempts per configuration
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`📤 Trying ${configName} (attempt ${attempt}/2)...`);
+        const info = await trySendWithConfig(config, mailOptions);
+        console.log(
+          `✅ Email sent via ${configName}! MessageId: ${info.messageId}`
         );
-        // Reset cached transporter so next attempt creates fresh one
-        cachedTransporter = null;
-        throw new Error(
-          "Gmail authentication failed. Please verify your EMAIL_USER and EMAIL_PASS (must be a 16-character App Password with no spaces)."
+        return info;
+      } catch (err) {
+        lastError = err;
+        console.log(
+          `❌ ${configName} attempt ${attempt} failed: ${err.message}`
         );
-      }
 
-      // For timeout/connection errors, retry
-      if (attempt < maxRetries) {
-        const delay = attempt * 5000; // 5s, 10s, 15s
-        console.log(`⏳ Retrying in ${delay / 1000}s...`);
-        // Reset cached transporter to create fresh connection
-        cachedTransporter = null;
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        // If it's an authentication error, don't retry with same config
+        if (err.code === "EAUTH" || err.responseCode === 535) {
+          console.error(
+            "🔑 Authentication error — EMAIL_USER or EMAIL_PASS is incorrect"
+          );
+          console.error(
+            "   Make sure EMAIL_PASS is a 16-character Gmail App Password (no spaces)"
+          );
+          break; // Skip to next config
+        }
+
+        // Wait before retrying
+        if (attempt < 2) {
+          console.log("   ⏳ Waiting 5s before retry...");
+          await new Promise((r) => setTimeout(r, 5000));
+        }
       }
     }
   }
 
-  // All retries failed
-  console.error("❌ All email send attempts failed!");
+  // All configurations failed
+  console.error("❌ ALL email configurations failed!");
   console.error("   Last error:", lastError?.message);
-  
-  // Reset transporter for next time
-  cachedTransporter = null;
+  console.error("   Possible causes:");
+  console.error(
+    "   1. EMAIL_PASS is wrong (must be 16-char Gmail App Password, not your Gmail password)"
+  );
+  console.error(
+    "   2. 2-Step Verification is not enabled on the Gmail account"
+  );
+  console.error("   3. The hosting platform may be blocking SMTP connections");
 
   throw new Error(
-    `Failed to send email after ${maxRetries} attempts. Error: ${lastError?.message}. This may be a network issue on the hosting platform.`
+    lastError?.code === "EAUTH" || lastError?.responseCode === 535
+      ? "Gmail authentication failed. Make sure EMAIL_PASS is a 16-character App Password (not your regular Gmail password). Enable 2-Step Verification first at myaccount.google.com/security."
+      : `Unable to send email. All SMTP configurations failed. Last error: ${lastError?.message}`
   );
 };
 
@@ -237,3 +230,4 @@ const getPasswordResetEmailTemplate = (userName, resetUrl) => {
 };
 
 module.exports = { sendEmail, getPasswordResetEmailTemplate };
+

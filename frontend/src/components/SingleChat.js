@@ -314,8 +314,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
       data.append("cloud_name", "dejog9zgj");
 
       // Determine resource type based on file
-      // Cloudinary requires correct resource_type:
-      //   "image" for images, "video" for video/audio, "raw" for everything else (PDF, docs, etc.)
+      // "image" for images, "video" for video/audio, "raw" for documents (PDF, docs, etc.)
       let resourceType = "raw";
       if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
         resourceType = "video";
@@ -323,18 +322,40 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
         resourceType = "image";
       }
 
-      const uploadRes = await axios.post(
-        `https://api.cloudinary.com/v1_1/dejog9zgj/${resourceType}/upload`,
-        data,
-        {
-          onUploadProgress: (progressEvent) => {
-            const percentCompleted = Math.round(
-              (progressEvent.loaded * 100) / progressEvent.total
-            );
-            setUploadProgress(percentCompleted);
-          },
+      let uploadRes;
+      const uploadConfig = {
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / progressEvent.total
+          );
+          setUploadProgress(percentCompleted);
+        },
+      };
+
+      try {
+        // Try uploading with the determined resource type
+        uploadRes = await axios.post(
+          `https://api.cloudinary.com/v1_1/dejog9zgj/${resourceType}/upload`,
+          data,
+          uploadConfig
+        );
+      } catch (uploadErr) {
+        // If raw upload fails (preset may not support it), fallback to auto
+        if (resourceType === "raw") {
+          console.log("Raw upload failed, trying auto...");
+          const fallbackData = new FormData();
+          fallbackData.append("file", file);
+          fallbackData.append("upload_preset", "chat-app");
+          fallbackData.append("cloud_name", "dejog9zgj");
+          uploadRes = await axios.post(
+            `https://api.cloudinary.com/v1_1/dejog9zgj/auto/upload`,
+            fallbackData,
+            uploadConfig
+          );
+        } else {
+          throw uploadErr;
         }
-      );
+      }
 
       const fileUrl = uploadRes.data.secure_url;
 
