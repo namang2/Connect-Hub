@@ -19,12 +19,43 @@ const formatFileSize = (bytes) => {
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 };
 
-// Helper function to download file - uses backend proxy to avoid CORS issues
+// Helper function to download file - uses multiple strategies for reliability
 const downloadFile = async (url, fileName) => {
+  const safeName = fileName || 'download';
+  
+  // Strategy 1: For Cloudinary URLs, modify URL to force download (fl_attachment)
+  if (url && url.includes('cloudinary.com')) {
+    try {
+      // Add fl_attachment to Cloudinary URL to force download
+      const cloudinaryDownloadUrl = url.includes('/upload/')
+        ? url.replace('/upload/', '/upload/fl_attachment/')
+        : url;
+      
+      const response = await fetch(cloudinaryDownloadUrl);
+      if (response.ok) {
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.download = safeName;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        setTimeout(() => {
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(blobUrl);
+        }, 300);
+        return;
+      }
+    } catch (cloudErr) {
+      console.log('Cloudinary direct download failed, trying proxy...');
+    }
+  }
+
+  // Strategy 2: Use backend proxy endpoint
   try {
-    // Use backend proxy endpoint for reliable downloads
     const userInfo = JSON.parse(localStorage.getItem("userInfo"));
-    const proxyUrl = `/api/message/download?url=${encodeURIComponent(url)}&name=${encodeURIComponent(fileName || 'download')}`;
+    const proxyUrl = `/api/message/download?url=${encodeURIComponent(url)}&name=${encodeURIComponent(safeName)}`;
     
     const response = await fetch(proxyUrl, {
       headers: {
@@ -37,44 +68,54 @@ const downloadFile = async (url, fileName) => {
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = blobUrl;
-      link.download = fileName || 'download';
+      link.download = safeName;
       link.style.display = 'none';
       document.body.appendChild(link);
       link.click();
-
       setTimeout(() => {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(blobUrl);
-      }, 200);
+      }, 300);
       return;
     }
+  } catch (proxyErr) {
+    console.log('Proxy download failed, trying direct...');
+  }
 
-    // Fallback: try direct fetch from original URL
-    try {
-      const directResponse = await fetch(url);
-      if (directResponse.ok) {
-        const blob = await directResponse.blob();
-        const blobUrl = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.download = fileName || 'download';
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        setTimeout(() => {
-          document.body.removeChild(link);
-          window.URL.revokeObjectURL(blobUrl);
-        }, 200);
-        return;
-      }
-    } catch (directErr) {
-      console.log('Direct fetch failed');
+  // Strategy 3: Direct fetch from original URL
+  try {
+    const directResponse = await fetch(url, { mode: 'cors' });
+    if (directResponse.ok) {
+      const blob = await directResponse.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = safeName;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(blobUrl);
+      }, 300);
+      return;
     }
+  } catch (directErr) {
+    console.log('Direct fetch failed');
+  }
 
+  // Strategy 4: Use anchor tag with download attribute
+  try {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = safeName;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => document.body.removeChild(link), 300);
+  } catch (err) {
     // Last fallback: open in new tab
-    window.open(url, '_blank');
-  } catch (error) {
-    console.error('Download error:', error);
     window.open(url, '_blank');
   }
 };

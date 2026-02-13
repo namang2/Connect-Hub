@@ -141,9 +141,12 @@ const forgotPassword = asyncHandler(async (req, res) => {
   const resetToken = user.getResetPasswordToken();
   await user.save({ validateBeforeSave: false });
 
-  // Create reset URL - use FRONTEND_URL for production
-  const baseUrl = process.env.FRONTEND_URL || 
-    (process.env.NODE_ENV === "production" ? `${req.protocol}://${req.get("host")}` : "http://localhost:3000");
+  // Create reset URL - detect local vs deployed automatically
+  const host = req.get("host") || "";
+  const isLocalhost = host.includes("localhost") || host.includes("127.0.0.1");
+  const baseUrl = isLocalhost
+    ? "http://localhost:3000"
+    : (process.env.FRONTEND_URL || `${req.protocol}://${req.get("host")}`);
   const resetUrl = `${baseUrl}/reset-password/${resetToken}`;
 
   console.log("📧 Sending password reset email to:", user.email);

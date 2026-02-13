@@ -112,51 +112,87 @@ const VideoCall = ({
 
   // Play remote audio reliably with retry and user gesture handling
   const playRemoteAudio = useCallback((stream) => {
-    if (!remoteAudioRef.current) return;
+    console.log("🔊 playRemoteAudio called, stream tracks:", stream.getAudioTracks().length);
     
-    // Create a fresh audio element if needed to avoid stale references
-    const audioEl = remoteAudioRef.current;
-    audioEl.srcObject = stream;
-    audioEl.volume = 1.0;
-    audioEl.muted = false;
+    // Method 1: Use the dedicated audio ref
+    if (remoteAudioRef.current) {
+      const audioEl = remoteAudioRef.current;
+      audioEl.srcObject = stream;
+      audioEl.volume = 1.0;
+      audioEl.muted = false;
+      audioEl.autoplay = true;
+    }
+
+    // Method 2: Also create a backup audio element (some browsers need this)
+    const backupAudio = new Audio();
+    backupAudio.srcObject = stream;
+    backupAudio.volume = 1.0;
+    backupAudio.autoplay = true;
 
     let retries = 0;
-    const maxRetries = 10;
+    const maxRetries = 15;
     const tryPlay = () => {
-      if (!remoteAudioRef.current) return;
-      remoteAudioRef.current.play()
+      const audioEl = remoteAudioRef.current || backupAudio;
+      if (!audioEl || !audioEl.srcObject) return;
+      
+      // Ensure srcObject is still set
+      audioEl.srcObject = stream;
+      audioEl.volume = 1.0;
+      audioEl.muted = false;
+
+      audioEl.play()
         .then(() => {
-          console.log("✅ Remote audio playing successfully");
+          console.log("✅ Remote audio playing successfully (attempt " + (retries + 1) + ")");
           setAudioBlocked(false);
         })
         .catch((err) => {
           console.log(`Audio play attempt ${retries + 1} failed:`, err.message);
           if (retries < maxRetries) {
             retries++;
-            setTimeout(tryPlay, 300 * retries);
+            setTimeout(tryPlay, 200 * retries);
           } else {
-            // Show unmute button for user interaction
             console.log("⚠️ Audio autoplay blocked. Showing unmute button.");
             setAudioBlocked(true);
           }
         });
+      
+      // Also try the backup
+      if (audioEl !== backupAudio) {
+        backupAudio.play().catch(() => {});
+      }
     };
     
-    // Small delay to ensure stream is ready
-    setTimeout(tryPlay, 100);
+    // Start trying immediately
+    tryPlay();
   }, []);
 
   // Manual audio unlock (for browsers that block autoplay)
   const unlockAudio = useCallback(() => {
+    // Try playing the ref audio element
     if (remoteAudioRef.current && remoteAudioRef.current.srcObject) {
+      remoteAudioRef.current.muted = false;
+      remoteAudioRef.current.volume = 1.0;
       remoteAudioRef.current.play()
         .then(() => {
-          console.log("✅ Audio unlocked by user gesture");
+          console.log("✅ Audio unlocked by user gesture (ref)");
           setAudioBlocked(false);
         })
         .catch((err) => console.error("Audio unlock failed:", err));
     }
-  }, []);
+    
+    // Also try creating a fresh audio element from the remote stream
+    if (remoteStream) {
+      const freshAudio = new Audio();
+      freshAudio.srcObject = remoteStream;
+      freshAudio.volume = 1.0;
+      freshAudio.play()
+        .then(() => {
+          console.log("✅ Audio unlocked via fresh element");
+          setAudioBlocked(false);
+        })
+        .catch((err) => console.error("Fresh audio unlock failed:", err));
+    }
+  }, [remoteStream]);
 
   // Initialize local media stream
   const initializeMedia = useCallback(async () => {
@@ -229,7 +265,7 @@ const VideoCall = ({
     };
 
     pc.ontrack = (event) => {
-      console.log("📡 Remote track received:", event.track.kind, "readyState:", event.track.readyState);
+      console.log("📡 Remote track received:", event.track.kind, "readyState:", event.track.readyState, "enabled:", event.track.enabled);
       const stream = event.streams[0];
       setRemoteStream(stream);
 
@@ -237,15 +273,15 @@ const VideoCall = ({
         remoteVideoRef.current.srcObject = stream;
       }
 
-      // Always play audio via dedicated audio element
-      if (event.track.kind === "audio") {
-        console.log("🔊 Audio track received, attempting playback...");
-        playRemoteAudio(stream);
-      }
-      
-      // Also try if stream has audio tracks (for combined streams)
-      if (stream.getAudioTracks().length > 0 && event.track.kind !== "audio") {
-        console.log("🔊 Stream has audio tracks, attempting playback...");
+      // Always play audio via dedicated audio element for ANY track event
+      // This ensures audio plays whether it arrives as audio track or combined stream
+      if (stream && stream.getAudioTracks().length > 0) {
+        console.log("🔊 Audio tracks available:", stream.getAudioTracks().length, "- attempting playback...");
+        // Ensure audio tracks are enabled
+        stream.getAudioTracks().forEach(track => {
+          track.enabled = true;
+          console.log("  Audio track:", track.id, "enabled:", track.enabled, "readyState:", track.readyState);
+        });
         playRemoteAudio(stream);
       }
     };
@@ -520,8 +556,13 @@ const VideoCall = ({
       <ModalOverlay bg="blackAlpha.900" />
       <ModalContent bg="#0a0a1a" borderRadius="0" m={0}>
         <ModalBody p={0} display="flex" flexDirection="column" h="100vh">
-          {/* Hidden audio element for reliable remote audio playback */}
-          <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: "none" }} />
+          {/* Audio element for reliable remote audio playback - positioned off-screen (NOT display:none) */}
+          <audio 
+            ref={remoteAudioRef} 
+            autoPlay 
+            playsInline 
+            style={{ position: "absolute", left: "-9999px", top: "-9999px" }} 
+          />
           
           {/* Audio blocked overlay - user needs to tap to enable audio */}
           {audioBlocked && callStatus === "connected" && (

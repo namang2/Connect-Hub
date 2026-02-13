@@ -229,38 +229,57 @@ const downloadFileProxy = asyncHandler(async (req, res) => {
   try {
     const https = require("https");
     const http = require("http");
-    const parsedUrl = new URL(url);
-    const protocol = parsedUrl.protocol === "https:" ? https : http;
 
-    protocol.get(url, (fileResponse) => {
-      if (fileResponse.statusCode === 301 || fileResponse.statusCode === 302) {
-        // Handle redirect
-        const redirectUrl = fileResponse.headers.location;
-        protocol.get(redirectUrl, (redirectedResponse) => {
-          const contentType = redirectedResponse.headers["content-type"] || "application/octet-stream";
-          res.setHeader("Content-Type", contentType);
-          res.setHeader("Content-Disposition", `attachment; filename="${name || 'download'}"`);
-          if (redirectedResponse.headers["content-length"]) {
-            res.setHeader("Content-Length", redirectedResponse.headers["content-length"]);
-          }
-          redirectedResponse.pipe(res);
-        }).on("error", (err) => {
-          res.status(500).json({ message: "Error downloading file" });
-        });
+    // Recursive function to follow redirects (up to 5 levels)
+    const fetchWithRedirects = (fetchUrl, redirectCount = 0) => {
+      if (redirectCount > 5) {
+        res.status(500).json({ message: "Too many redirects" });
         return;
       }
 
-      const contentType = fileResponse.headers["content-type"] || "application/octet-stream";
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Content-Disposition", `attachment; filename="${name || 'download'}"`);
-      if (fileResponse.headers["content-length"]) {
-        res.setHeader("Content-Length", fileResponse.headers["content-length"]);
-      }
-      fileResponse.pipe(res);
-    }).on("error", (err) => {
-      console.error("Download proxy error:", err);
-      res.status(500).json({ message: "Error downloading file" });
-    });
+      const parsedUrl = new URL(fetchUrl);
+      const protocol = parsedUrl.protocol === "https:" ? https : http;
+
+      protocol.get(fetchUrl, (fileResponse) => {
+        // Follow redirects
+        if ([301, 302, 303, 307, 308].includes(fileResponse.statusCode)) {
+          const redirectUrl = fileResponse.headers.location;
+          if (redirectUrl) {
+            // Handle relative URLs
+            const absoluteUrl = redirectUrl.startsWith("http") 
+              ? redirectUrl 
+              : new URL(redirectUrl, fetchUrl).toString();
+            fetchWithRedirects(absoluteUrl, redirectCount + 1);
+            return;
+          }
+        }
+
+        if (fileResponse.statusCode !== 200) {
+          res.status(fileResponse.statusCode || 500).json({ message: "File not found or unavailable" });
+          return;
+        }
+
+        const contentType = fileResponse.headers["content-type"] || "application/octet-stream";
+        const fileName = name || "download";
+        
+        // Set proper download headers
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(fileName)}"`);
+        res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+        if (fileResponse.headers["content-length"]) {
+          res.setHeader("Content-Length", fileResponse.headers["content-length"]);
+        }
+        
+        fileResponse.pipe(res);
+      }).on("error", (err) => {
+        console.error("Download proxy error:", err);
+        if (!res.headersSent) {
+          res.status(500).json({ message: "Error downloading file" });
+        }
+      });
+    };
+
+    fetchWithRedirects(url);
   } catch (error) {
     res.status(500);
     throw new Error("Error downloading file: " + error.message);

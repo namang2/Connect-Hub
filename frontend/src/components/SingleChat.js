@@ -675,19 +675,36 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     setJoiningMeeting(false);
   };
 
-  // Listen for incoming calls and meeting events
+  // CRITICAL: Listen for incoming calls - STABLE listener that never re-registers
+  // This must NOT depend on selectedChat to avoid missing calls during chat switches
   useEffect(() => {
     if (!socket.current) return;
 
     const handleIncomingCall = (callData) => {
+      console.log("📞 Incoming call received:", callData);
       setIncomingCall(callData);
     };
 
+    socket.current.on("call:incoming", handleIncomingCall);
+
+    return () => {
+      if (socket.current) {
+        socket.current.off("call:incoming", handleIncomingCall);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socketConnected]); // Only re-register when socket connects
+
+  // Listen for meeting events (these can depend on selectedChat)
+  useEffect(() => {
+    if (!socket.current) return;
+
     const handleMeetingCreated = ({ meetingId, meetingType }) => {
+      const chatRef = selectedChatCompare.current;
       setMeetingInfo({
         meetingId,
-        chatName: selectedChat?.chatName,
-        chatId: selectedChat?._id,
+        chatName: chatRef?.chatName,
+        chatId: chatRef?._id,
         meetingType: meetingType || "meeting",
       });
       setIsInMeeting(true);
@@ -709,7 +726,6 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     };
 
     const handleMeetingStarted = ({ meetingId, chatId, creatorInfo, meetingType }) => {
-      // Set active meeting so user can late-join
       setActiveMeeting({
         meetingId,
         chatId,
@@ -735,21 +751,22 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     };
 
     const handleActiveStatus = ({ chatId, activeMeeting: meetingData }) => {
-      if (chatId === selectedChat?._id) {
+      const chatRef = selectedChatCompare.current;
+      if (chatId === chatRef?._id) {
         setActiveMeeting(meetingData);
       }
     };
 
-    socket.current.on("call:incoming", handleIncomingCall);
     socket.current.on("meeting:created", handleMeetingCreated);
     socket.current.on("meeting:started", handleMeetingStarted);
     socket.current.on("meeting:active-status", handleActiveStatus);
 
     return () => {
-      socket.current.off("call:incoming", handleIncomingCall);
-      socket.current.off("meeting:created", handleMeetingCreated);
-      socket.current.off("meeting:started", handleMeetingStarted);
-      socket.current.off("meeting:active-status", handleActiveStatus);
+      if (socket.current) {
+        socket.current.off("meeting:created", handleMeetingCreated);
+        socket.current.off("meeting:started", handleMeetingStarted);
+        socket.current.off("meeting:active-status", handleActiveStatus);
+      }
     };
   }, [selectedChat, toast]);
 

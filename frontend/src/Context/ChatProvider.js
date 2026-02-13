@@ -22,7 +22,7 @@ const ChatProvider = ({ children }) => {
   useEffect(() => {
     const userInfo = JSON.parse(localStorage.getItem("userInfo"));
     if (userInfo) {
-      setUser(userInfo);
+    setUser(userInfo);
     }
   }, []);
 
