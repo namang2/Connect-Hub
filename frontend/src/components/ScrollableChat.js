@@ -197,10 +197,9 @@ const LocationMessage = ({ location, isSender }) => {
 // File message component — ALL files download through backend proxy
 const FileMessage = ({ file, isSender }) => {
   const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState(false);
 
   if (!file || !file.url) return null;
-
-  const [downloadError, setDownloadError] = useState(false);
 
   const handleDownload = async (e) => {
     e.preventDefault();
