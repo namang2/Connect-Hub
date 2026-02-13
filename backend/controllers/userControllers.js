@@ -152,38 +152,29 @@ const forgotPassword = asyncHandler(async (req, res) => {
   console.log("📧 Sending password reset email to:", user.email);
   console.log("🔗 Reset URL:", resetUrl);
 
-  // IMPORTANT: Respond immediately BEFORE sending email
-  // Render's free tier has a 30-second request timeout.
-  // SMTP can take 60+ seconds. If we wait for email to send,
-  // Render kills the request and user sees a 500 error.
-  // Instead: save token, respond instantly, send email in background.
-  res.json({
-    success: true,
-    message: `Password reset link is being sent to ${user.email}. Please check your inbox and spam folder (may take up to 2 minutes).`,
-  });
-
-  // Send email in background (fire-and-forget)
-  // This runs AFTER the response is sent, so Render timeout doesn't affect it
-  sendEmail({
-    email: user.email,
-    subject: "🔐 Connect Hub - Password Reset Request",
-    html: getPasswordResetEmailTemplate(user.name, resetUrl),
-  })
-    .then(() => {
-      console.log("✅ Password reset email sent successfully to:", user.email);
-    })
-    .catch(async (error) => {
-      console.error("❌ Background email send failed:", error.message);
-      // Clear the reset token since email wasn't delivered
-      try {
-        user.resetPasswordToken = undefined;
-        user.resetPasswordExpire = undefined;
-        await user.save({ validateBeforeSave: false });
-        console.log("🧹 Reset token cleared after email failure");
-      } catch (saveErr) {
-        console.error("Failed to clear reset token:", saveErr.message);
-      }
+  try {
+    await sendEmail({
+      email: user.email,
+      subject: "🔐 Connect Hub - Password Reset Request",
+      html: getPasswordResetEmailTemplate(user.name, resetUrl),
     });
+
+    console.log("✅ Password reset email sent to:", user.email);
+    res.json({
+      success: true,
+      message: `Password reset link has been sent to ${user.email}. Please check your inbox and spam folder.`,
+    });
+  } catch (error) {
+    console.error("❌ Failed to send reset email:", error.message);
+
+    // Clear the reset token since email wasn't sent
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    res.status(500);
+    throw new Error(error.message);
+  }
 });
 
 //@description     Reset password
