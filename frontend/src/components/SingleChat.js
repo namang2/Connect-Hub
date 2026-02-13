@@ -285,7 +285,8 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     }, timerLength);
   };
 
-  // File upload handler
+  // File upload handler — uploads through the backend which uses Cloudinary SDK
+  // with resource_type "auto", so ALL file types are supported reliably.
   const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -308,66 +309,28 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     setUploadProgress(0);
 
     try {
-      const data = new FormData();
-      data.append("file", file);
-      data.append("upload_preset", "chat-app");
-      data.append("cloud_name", "dejog9zgj");
+      // Step 1: Upload file through the backend (handles all file types)
+      const formData = new FormData();
+      formData.append("file", file);
 
-      // Build a prioritized list of Cloudinary resource types to try.
-      // Different file types need different endpoints:
-      //   "image"  → images (jpg, png, gif, webp, svg, bmp, tiff, ico) and PDF
-      //   "video"  → video and audio files
-      //   "raw"    → everything else (docx, txt, xlsx, zip, csv, etc.)
-      //   "auto"   → auto-detect (may not work with all presets)
-      // We try the most likely type first, then fall back to others.
-      let resourceTypes;
-      if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
-        resourceTypes = ["video"];
-      } else if (
-        file.type.startsWith("image/") ||
-        file.type === "application/pdf"
-      ) {
-        resourceTypes = ["image"];
-      } else {
-        // Documents, spreadsheets, archives, text files, etc.
-        // Try raw first (correct type for docs), then auto, then image as last resort
-        resourceTypes = ["raw", "auto", "image"];
-      }
-
-      let uploadRes = null;
-      let lastUploadError = null;
-
-      for (const resourceType of resourceTypes) {
-        try {
-          uploadRes = await axios.post(
-            `https://api.cloudinary.com/v1_1/dejog9zgj/${resourceType}/upload`,
-            data,
-            {
-              onUploadProgress: (progressEvent) => {
-                const percentCompleted = Math.round(
-                  (progressEvent.loaded * 100) / progressEvent.total
-                );
-                setUploadProgress(percentCompleted);
-              },
-            }
+      const uploadConfig = {
+        headers: {
+          "Content-Type": "multipart/form-data",
+          Authorization: `Bearer ${user.token}`,
+        },
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / progressEvent.total
           );
-          break; // Upload succeeded, exit the loop
-        } catch (err) {
-          lastUploadError = err;
-          console.log(
-            `Cloudinary upload as "${resourceType}" failed (${err.response?.status || err.message}), trying next type...`
-          );
-        }
-      }
+          setUploadProgress(percentCompleted);
+        },
+      };
 
-      if (!uploadRes) {
-        throw lastUploadError || new Error("All upload attempts failed");
-      }
+      const uploadRes = await axios.post("/api/upload", formData, uploadConfig);
+      const fileUrl = uploadRes.data.url;
 
-      const fileUrl = uploadRes.data.secure_url;
-
-      // Send file message to backend
-      const config = {
+      // Step 2: Save the file message in the chat
+      const msgConfig = {
         headers: {
           "Content-type": "application/json",
           Authorization: `Bearer ${user.token}`,
@@ -384,7 +347,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
           fileSize: file.size,
           content: file.name,
         },
-        config
+        msgConfig
       );
 
       socket.current.emit("new message", messageData);
@@ -398,9 +361,14 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
         position: "bottom",
       });
     } catch (error) {
+      const errMsg =
+        error.response?.data?.message ||
+        error.message ||
+        "Failed to upload file";
+      console.error("File upload error:", errMsg);
       toast({
         title: "Error uploading file",
-        description: error.message || "Failed to upload file",
+        description: errMsg,
         status: "error",
         duration: 5000,
         isClosable: true,
