@@ -313,28 +313,56 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
       data.append("upload_preset", "chat-app");
       data.append("cloud_name", "dejog9zgj");
 
-      // Determine Cloudinary resource type:
-      // - "video" for video/audio files
-      // - "image" for everything else (images AND documents like PDFs)
-      // Note: Cloudinary "image" type accepts PDFs and stores the original file.
-      // The upload preset "chat-app" supports "image" and "video" only.
-      let resourceType = "image";
+      // Build a prioritized list of Cloudinary resource types to try.
+      // Different file types need different endpoints:
+      //   "image"  → images (jpg, png, gif, webp, svg, bmp, tiff, ico) and PDF
+      //   "video"  → video and audio files
+      //   "raw"    → everything else (docx, txt, xlsx, zip, csv, etc.)
+      //   "auto"   → auto-detect (may not work with all presets)
+      // We try the most likely type first, then fall back to others.
+      let resourceTypes;
       if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
-        resourceType = "video";
+        resourceTypes = ["video"];
+      } else if (
+        file.type.startsWith("image/") ||
+        file.type === "application/pdf"
+      ) {
+        resourceTypes = ["image"];
+      } else {
+        // Documents, spreadsheets, archives, text files, etc.
+        // Try raw first (correct type for docs), then auto, then image as last resort
+        resourceTypes = ["raw", "auto", "image"];
       }
 
-      const uploadRes = await axios.post(
-        `https://api.cloudinary.com/v1_1/dejog9zgj/${resourceType}/upload`,
-        data,
-        {
-          onUploadProgress: (progressEvent) => {
-            const percentCompleted = Math.round(
-              (progressEvent.loaded * 100) / progressEvent.total
-            );
-            setUploadProgress(percentCompleted);
-          },
+      let uploadRes = null;
+      let lastUploadError = null;
+
+      for (const resourceType of resourceTypes) {
+        try {
+          uploadRes = await axios.post(
+            `https://api.cloudinary.com/v1_1/dejog9zgj/${resourceType}/upload`,
+            data,
+            {
+              onUploadProgress: (progressEvent) => {
+                const percentCompleted = Math.round(
+                  (progressEvent.loaded * 100) / progressEvent.total
+                );
+                setUploadProgress(percentCompleted);
+              },
+            }
+          );
+          break; // Upload succeeded, exit the loop
+        } catch (err) {
+          lastUploadError = err;
+          console.log(
+            `Cloudinary upload as "${resourceType}" failed (${err.response?.status || err.message}), trying next type...`
+          );
         }
-      );
+      }
+
+      if (!uploadRes) {
+        throw lastUploadError || new Error("All upload attempts failed");
+      }
 
       const fileUrl = uploadRes.data.secure_url;
 
