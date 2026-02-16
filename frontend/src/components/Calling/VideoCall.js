@@ -3,8 +3,6 @@ import {
   ModalOverlay,
   ModalContent,
   ModalBody,
-  Button,
-  VStack,
   Text,
   Box,
   Flex,
@@ -14,23 +12,16 @@ import {
   keyframes,
   useToast,
 } from "@chakra-ui/react";
-import { PhoneIcon } from "@chakra-ui/icons";
 import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
 
 // Icons
 const MicIcon = ({ isOn, ...props }) => (
-  <Box as="span" {...props}>
-    {isOn ? "🎤" : "🔇"}
-  </Box>
+  <Box as="span" {...props}>{isOn ? "🎤" : "🔇"}</Box>
 );
-
 const VideoIcon = ({ isOn, ...props }) => (
-  <Box as="span" {...props}>
-    {isOn ? "📹" : "📷"}
-  </Box>
+  <Box as="span" {...props}>{isOn ? "📹" : "📷"}</Box>
 );
-
 const EndCallIcon = (props) => (
   <Box as="span" {...props}>📵</Box>
 );
@@ -40,6 +31,32 @@ const pulse = keyframes`
   50% { opacity: 1; }
   100% { opacity: 0.5; }
 `;
+
+// ──────────────────────────────────────────────
+// Helper: wait until ICE gathering finishes or a timeout elapses.
+// After this resolves, pc.localDescription contains the complete SDP
+// with all gathered ICE candidates baked in — no separate trickle needed.
+// ──────────────────────────────────────────────
+const waitForIceGathering = (pc, timeout = 6000) =>
+  new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      console.log("⏰ ICE gathering timed out — sending what we have");
+      resolve();
+    }, timeout);
+
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(timer);
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
 
 const VideoCall = ({
   isOpen,
@@ -51,6 +68,7 @@ const VideoCall = ({
   chatId,
   userToken,
   onCallEnded,
+  iceCandidateBuffer, // ref from parent — buffered ICE candidates
 }) => {
   const [callStatus, setCallStatus] = useState("connecting");
   const [isAudioOn, setIsAudioOn] = useState(true);
@@ -68,8 +86,15 @@ const VideoCall = ({
   const callTimerRef = useRef(null);
   const callDurationRef = useRef(0);
   const endCallCalledRef = useRef(false);
-  const iceCandidateBuffer = useRef([]);
   const remoteDescriptionSet = useRef(false);
+  const initializedRef = useRef(false); // prevents double-init
+
+  // ─── Stable refs for callbacks that change every parent render ───
+  // This prevents the useEffect/useCallback chain from cascading re-runs.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const onCallEndedRef = useRef(onCallEnded);
+  onCallEndedRef.current = onCallEnded;
 
   const toast = useToast();
 
@@ -107,260 +132,231 @@ const VideoCall = ({
 
   // Format call duration
   const formatDuration = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
-  // ───── useEffect: Attach LOCAL stream to local video element ─────
+  // ───── useEffect: attach LOCAL stream to video element ─────
   useEffect(() => {
     if (localVideoRef.current && localStream && callType === "video") {
       localVideoRef.current.srcObject = localStream;
     }
   }, [localStream, callType]);
 
-  // ───── useEffect: Attach REMOTE stream to remote video + audio elements ─────
-  // This is the KEY fix: instead of setting srcObject inside ontrack (which races
-  // with React's conditional rendering), we set it here after React has rendered
-  // the <video>/<audio> elements.
+  // ───── useEffect: attach REMOTE stream to video + audio elements ─────
+  // KEY FIX: this runs AFTER React renders the <video>/<audio> elements,
+  // avoiding the old race where ontrack set srcObject on a null ref.
   useEffect(() => {
     if (!remoteStream) return;
 
-    // Attach to the video element
+    // Video
     if (remoteVideoRef.current) {
-      console.log("🎥 useEffect: attaching remoteStream to video element");
+      console.log("🎥 Attaching remote stream to video element");
       remoteVideoRef.current.srcObject = remoteStream;
+      // Force play in case autoPlay doesn't trigger
+      remoteVideoRef.current.play().catch(() => {});
     }
 
-    // Attach to the audio element and play
+    // Audio
     if (remoteAudioRef.current) {
-      console.log("🔊 useEffect: attaching remoteStream to audio element");
-      const audioEl = remoteAudioRef.current;
-      audioEl.srcObject = remoteStream;
-      audioEl.volume = 1.0;
-      audioEl.muted = false;
+      console.log("🔊 Attaching remote stream to audio element");
+      const el = remoteAudioRef.current;
+      el.srcObject = remoteStream;
+      el.volume = 1.0;
+      el.muted = false;
 
       let retries = 0;
-      const maxRetries = 20;
       const tryPlay = () => {
-        if (!audioEl.srcObject) return;
-        audioEl.play()
+        el.play()
           .then(() => {
-            console.log("✅ Remote audio playing (attempt " + (retries + 1) + ")");
+            console.log("✅ Remote audio playing (try " + (retries + 1) + ")");
             setAudioBlocked(false);
           })
-          .catch((err) => {
-            console.log(`Audio play attempt ${retries + 1} failed:`, err.message);
-            if (retries < maxRetries) {
-              retries++;
-              setTimeout(tryPlay, 300 * Math.min(retries, 5));
-            } else {
-              console.log("⚠️ Audio autoplay blocked. User must tap to enable.");
-              setAudioBlocked(true);
-            }
+          .catch(() => {
+            if (retries++ < 20) setTimeout(tryPlay, 300);
+            else setAudioBlocked(true);
           });
       };
       tryPlay();
-
-      // Also create a backup audio element (some browsers need this)
-      try {
-        const backup = new Audio();
-        backup.srcObject = remoteStream;
-        backup.volume = 1.0;
-        backup.play().catch(() => {});
-      } catch (e) {
-        // Ignore
-      }
     }
 
-    // Enable all audio tracks on the remote stream
-    remoteStream.getAudioTracks().forEach((t) => {
-      t.enabled = true;
-      console.log("  Remote audio track:", t.id, "enabled:", t.enabled, "readyState:", t.readyState);
-    });
-    remoteStream.getVideoTracks().forEach((t) => {
-      t.enabled = true;
-      console.log("  Remote video track:", t.id, "enabled:", t.enabled, "readyState:", t.readyState);
-    });
+    // Ensure all remote tracks are enabled
+    remoteStream.getAudioTracks().forEach((t) => { t.enabled = true; });
+    remoteStream.getVideoTracks().forEach((t) => { t.enabled = true; });
   }, [remoteStream]);
 
-  // Manual audio unlock (for browsers that block autoplay)
+  // Manual audio unlock
   const unlockAudio = useCallback(() => {
-    if (remoteAudioRef.current && remoteAudioRef.current.srcObject) {
-      remoteAudioRef.current.muted = false;
-      remoteAudioRef.current.volume = 1.0;
-      remoteAudioRef.current.play()
-        .then(() => {
-          console.log("✅ Audio unlocked by user gesture");
-          setAudioBlocked(false);
-        })
-        .catch((err) => console.error("Audio unlock failed:", err));
-    }
-    if (remoteStream) {
-      const fresh = new Audio();
-      fresh.srcObject = remoteStream;
-      fresh.volume = 1.0;
-      fresh.play()
-        .then(() => {
-          console.log("✅ Audio unlocked via fresh element");
-          setAudioBlocked(false);
-        })
-        .catch((err) => console.error("Fresh audio unlock failed:", err));
-    }
+    [remoteAudioRef.current, remoteStream && new Audio()].forEach((el) => {
+      if (!el) return;
+      if (!el.srcObject && remoteStream) el.srcObject = remoteStream;
+      el.volume = 1.0;
+      el.muted = false;
+      el.play()
+        .then(() => setAudioBlocked(false))
+        .catch(() => {});
+    });
   }, [remoteStream]);
 
-  // ───── Initialize local media stream ─────
+  // ───── Initialize local media ─────
   const initializeMedia = useCallback(async () => {
     try {
       const constraints = {
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: callType === "video"
           ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
           : false,
       };
-
-      console.log("📷🎤 Requesting getUserMedia with constraints:", JSON.stringify(constraints));
+      console.log("📷🎤 getUserMedia...");
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       localStreamRef.current = stream;
       setLocalStream(stream);
-
-      // Ensure all tracks are enabled
       stream.getAudioTracks().forEach((t) => { t.enabled = true; });
       stream.getVideoTracks().forEach((t) => { t.enabled = true; });
-
-      console.log("✅ Got local stream:", stream.getTracks().map((t) => `${t.kind}:${t.enabled}`));
+      console.log("✅ Local stream:", stream.getTracks().map((t) => `${t.kind}:${t.enabled}`).join(", "));
       return stream;
-    } catch (error) {
-      console.error("❌ Error accessing media devices:", error);
-      // Fallback: try audio only if video+audio failed
+    } catch (err) {
+      console.error("❌ getUserMedia error:", err);
       if (callType === "video") {
         try {
-          console.log("🔄 Falling back to audio-only...");
-          const audioStream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true },
-          });
-          localStreamRef.current = audioStream;
-          setLocalStream(audioStream);
+          const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+          localStreamRef.current = s;
+          setLocalStream(s);
           setIsVideoOn(false);
-          return audioStream;
-        } catch (audioErr) {
-          console.error("❌ Audio-only fallback also failed:", audioErr);
-        }
+          return s;
+        } catch (_) { /* fall through */ }
       }
-      toast({
-        title: "Media Error",
-        description: "Could not access camera/microphone. Please check permissions.",
-        status: "error",
-        duration: 5000,
-        isClosable: true,
-      });
+      toast({ title: "Media Error", description: "Enable camera/mic permissions.", status: "error", duration: 5000 });
       return null;
     }
   }, [callType, toast]);
 
-  // ───── Flush buffered ICE candidates ─────
-  const flushIceCandidates = useCallback(async () => {
-    const pc = peerConnectionRef.current;
-    if (!pc || !remoteDescriptionSet.current) return;
-
-    while (iceCandidateBuffer.current.length > 0) {
-      const candidate = iceCandidateBuffer.current.shift();
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        console.log("✅ Buffered ICE candidate added");
-      } catch (err) {
-        console.error("Error adding buffered ICE candidate:", err);
-      }
-    }
-  }, []);
-
   // ───── Start call timer ─────
   const startTimer = useCallback(() => {
-    if (callTimerRef.current) return; // already running
-    console.log("⏱️ Call timer started");
+    if (callTimerRef.current) return;
+    console.log("⏱️ Timer started");
     callTimerRef.current = setInterval(() => {
       callDurationRef.current += 1;
       setCallDuration(callDurationRef.current);
     }, 1000);
   }, []);
 
+  // ───── Save call record ─────
+  const saveCallRecord = useCallback(async (duration, status) => {
+    if (!chatId || !userToken) return;
+    try {
+      const { data } = await axios.post(
+        "/api/message/call",
+        { chatId, callType, duration, status },
+        { headers: { "Content-type": "application/json", Authorization: `Bearer ${userToken}` } }
+      );
+      if (socket) socket.emit("new message", data);
+      if (onCallEndedRef.current) onCallEndedRef.current(data);
+    } catch (e) {
+      console.error("Failed to save call record:", e);
+    }
+  }, [chatId, userToken, callType, socket]);
+
+  // ───── End call ─────
+  const endCall = useCallback((status) => {
+    if (endCallCalledRef.current) return;
+    endCallCalledRef.current = true;
+    console.log("📵 Ending call, status:", status || "ended");
+    const dur = callDurationRef.current;
+
+    if (localStreamRef.current) localStreamRef.current.getTracks().forEach((t) => t.stop());
+    if (peerConnectionRef.current) peerConnectionRef.current.close();
+    if (callTimerRef.current) clearInterval(callTimerRef.current);
+
+    if (socket && callInfo) {
+      socket.emit("call:end", {
+        callId: callInfo.callId,
+        to: callInfo.recipientId || callInfo.callerId,
+      });
+    }
+    if (!isIncoming) saveCallRecord(dur, status || "ended");
+    onCloseRef.current();
+  }, [socket, callInfo, isIncoming, saveCallRecord]);
+
   // ───── Create peer connection ─────
   const createPeerConnection = useCallback(async () => {
-    console.log("🔗 Creating RTCPeerConnection...");
+    console.log("🔗 Creating RTCPeerConnection");
     const pc = new RTCPeerConnection(ICE_SERVERS);
 
-    // Send ICE candidates to the other peer
-    pc.onicecandidate = (event) => {
-      if (event.candidate && socket) {
-        const to = callInfo?.recipientId || callInfo?.callerId;
-        console.log("🧊 Sending ICE candidate to:", to);
+    // Send ICE candidates (trickle — supplementary to gathered-complete)
+    pc.onicecandidate = (e) => {
+      if (e.candidate && socket) {
         socket.emit("call:ice-candidate", {
-          to,
-          candidate: event.candidate,
+          to: callInfo?.recipientId || callInfo?.callerId,
+          candidate: e.candidate,
         });
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log("🧊 ICE connection state:", pc.iceConnectionState);
+      console.log("🧊 ICE state:", pc.iceConnectionState);
       if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
         setCallStatus("connected");
         startTimer();
       }
     };
 
-    // ──── ontrack: receive remote media ────
     pc.ontrack = (event) => {
-      console.log("📡 Remote track received:", event.track.kind, "readyState:", event.track.readyState);
-      const stream = event.streams[0];
-      if (stream) {
-        // Set remoteStream state — the useEffect above will handle attaching
-        // it to the video/audio DOM elements AFTER React renders them.
-        setRemoteStream(stream);
-      }
+      console.log("📡 Remote track:", event.track.kind, event.track.readyState);
+      if (event.streams[0]) setRemoteStream(event.streams[0]);
     };
 
     pc.onconnectionstatechange = () => {
-      console.log("🔗 Connection state:", pc.connectionState);
+      console.log("🔗 State:", pc.connectionState);
       if (pc.connectionState === "connected") {
         setCallStatus("connected");
         startTimer();
-      } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+      } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         if (!endCallCalledRef.current) {
           endCallCalledRef.current = true;
-          if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach((t) => t.stop());
-          }
-          if (peerConnectionRef.current) {
-            peerConnectionRef.current.close();
-          }
-          if (callTimerRef.current) {
-            clearInterval(callTimerRef.current);
-          }
-          onClose();
+          if (localStreamRef.current) localStreamRef.current.getTracks().forEach((t) => t.stop());
+          if (peerConnectionRef.current) peerConnectionRef.current.close();
+          if (callTimerRef.current) clearInterval(callTimerRef.current);
+          onCloseRef.current();
         }
       }
     };
 
-    // Add local tracks to the peer connection
+    // Add local tracks
     const stream = localStreamRef.current || (await initializeMedia());
     if (stream) {
-      stream.getTracks().forEach((track) => {
-        console.log("➕ Adding local track:", track.kind, "enabled:", track.enabled);
-        pc.addTrack(track, stream);
+      stream.getTracks().forEach((t) => {
+        console.log("➕ Adding track:", t.kind);
+        pc.addTrack(t, stream);
       });
     }
 
     peerConnectionRef.current = pc;
     return pc;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [socket, callInfo, initializeMedia, onClose, startTimer]);
+  }, [socket, callInfo, initializeMedia, startTimer]);
 
-  // ───── Make outgoing call (caller side) ─────
+  // ───── Apply buffered ICE candidates from parent ─────
+  const applyBufferedCandidates = useCallback(async () => {
+    const pc = peerConnectionRef.current;
+    if (!pc || !remoteDescriptionSet.current) return;
+
+    // Drain the buffer from SingleChat
+    if (iceCandidateBuffer?.current?.length) {
+      console.log(`🧊 Applying ${iceCandidateBuffer.current.length} buffered ICE candidates`);
+      while (iceCandidateBuffer.current.length) {
+        const c = iceCandidateBuffer.current.shift();
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        } catch (e) {
+          console.warn("Buffered ICE add error:", e.message);
+        }
+      }
+    }
+  }, [iceCandidateBuffer]);
+
+  // ───── CALLER: make call ─────
   const makeCall = useCallback(async () => {
     try {
       setCallStatus("calling");
@@ -373,27 +369,27 @@ const VideoCall = ({
         offerToReceiveVideo: callType === "video",
       });
       await pc.setLocalDescription(offer);
-      console.log("📤 Sending offer to:", callInfo.recipientId);
+
+      // CRITICAL: wait for ICE gathering so the SDP contains all candidates.
+      // Without this, the offer has no candidates and the receiver can't connect.
+      console.log("⏳ Waiting for ICE gathering to complete...");
+      await waitForIceGathering(pc, 6000);
+      console.log("✅ ICE gathering done — sending offer with",
+        (pc.localDescription.sdp.match(/a=candidate/g) || []).length, "candidates");
 
       socket.emit("call:initiate", {
         to: callInfo.recipientId,
         callType,
-        offer,
+        offer: pc.localDescription, // complete SDP with all candidates
         callerInfo: callInfo.callerInfo,
       });
-    } catch (error) {
-      console.error("❌ Error making call:", error);
-      toast({
-        title: "Call Failed",
-        description: "Could not initiate the call. Check your network.",
-        status: "error",
-        duration: 5000,
-        isClosable: true,
-      });
+    } catch (err) {
+      console.error("❌ makeCall error:", err);
+      toast({ title: "Call Failed", description: "Could not start the call.", status: "error", duration: 5000 });
     }
   }, [initializeMedia, createPeerConnection, socket, callInfo, callType, toast]);
 
-  // ───── Answer incoming call (receiver side) ─────
+  // ───── RECEIVER: answer call ─────
   const answerCall = useCallback(async () => {
     try {
       setCallStatus("connecting");
@@ -406,184 +402,103 @@ const VideoCall = ({
         await pc.setRemoteDescription(new RTCSessionDescription(callInfo.offer));
         remoteDescriptionSet.current = true;
 
-        // Flush any ICE candidates that arrived before we set the remote description
-        await flushIceCandidates();
+        // Apply any ICE candidates that arrived while CallNotification was showing
+        await applyBufferedCandidates();
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        console.log("📤 Sending answer to:", callInfo.callerId);
+
+        // Wait for ICE gathering so the answer SDP includes all candidates
+        console.log("⏳ Waiting for ICE gathering...");
+        await waitForIceGathering(pc, 6000);
+        console.log("✅ Sending answer with",
+          (pc.localDescription.sdp.match(/a=candidate/g) || []).length, "candidates");
 
         socket.emit("call:accept", {
           callId: callInfo.callId,
-          answer,
+          answer: pc.localDescription, // complete SDP with all candidates
           to: callInfo.callerId,
         });
       }
-    } catch (error) {
-      console.error("❌ Error answering call:", error);
+    } catch (err) {
+      console.error("❌ answerCall error:", err);
     }
-  }, [initializeMedia, createPeerConnection, socket, callInfo, flushIceCandidates]);
+  }, [initializeMedia, createPeerConnection, socket, callInfo, applyBufferedCandidates]);
 
-  // ───── Save call record to chat ─────
-  const saveCallRecord = useCallback(
-    async (duration, status) => {
-      if (!chatId || !userToken) return;
-      try {
-        const config = {
-          headers: {
-            "Content-type": "application/json",
-            Authorization: `Bearer ${userToken}`,
-          },
-        };
-        const { data } = await axios.post(
-          "/api/message/call",
-          { chatId, callType, duration, status },
-          config
-        );
-        if (socket) {
-          socket.emit("new message", data);
-        }
-        if (onCallEnded) onCallEnded(data);
-      } catch (err) {
-        console.error("Failed to save call record:", err);
-      }
-    },
-    [chatId, userToken, callType, socket, onCallEnded]
-  );
-
-  // ───── End call ─────
-  const endCall = useCallback(
-    (status) => {
-      if (endCallCalledRef.current) return;
-      endCallCalledRef.current = true;
-      console.log("📵 Ending call, status:", status || "ended");
-
-      const finalDuration = callDurationRef.current;
-
-      // Stop all local tracks
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-
-      // Close peer connection
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
-
-      // Clear timer
-      if (callTimerRef.current) {
-        clearInterval(callTimerRef.current);
-      }
-
-      // Notify other party
-      if (socket && callInfo) {
-        socket.emit("call:end", {
-          callId: callInfo.callId,
-          to: callInfo?.recipientId || callInfo?.callerId,
-        });
-      }
-
-      // Save call record (only caller saves to avoid duplicates)
-      if (!isIncoming) {
-        saveCallRecord(finalDuration, status || "ended");
-      }
-
-      onClose();
-    },
-    [socket, callInfo, onClose, isIncoming, saveCallRecord]
-  );
-
-  // Toggle audio
+  // ───── Toggle audio/video ─────
   const toggleAudio = () => {
     if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsAudioOn(audioTrack.enabled);
-      }
+      const t = localStreamRef.current.getAudioTracks()[0];
+      if (t) { t.enabled = !t.enabled; setIsAudioOn(t.enabled); }
     }
   };
-
-  // Toggle video
   const toggleVideo = () => {
     if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        setIsVideoOn(videoTrack.enabled);
-      }
+      const t = localStreamRef.current.getVideoTracks()[0];
+      if (t) { t.enabled = !t.enabled; setIsVideoOn(t.enabled); }
     }
   };
 
-  // ───── Socket event handlers ─────
+  // ───── Socket listeners (STABLE — no recreations) ─────
   useEffect(() => {
     if (!socket) return;
 
     const handleCallAccepted = async ({ answer }) => {
       try {
-        console.log("✅ Call accepted — setting remote description (answer)...");
-        if (peerConnectionRef.current) {
-          await peerConnectionRef.current.setRemoteDescription(
-            new RTCSessionDescription(answer)
-          );
-          remoteDescriptionSet.current = true;
-          // Flush any ICE candidates that arrived before the answer
-          while (iceCandidateBuffer.current.length > 0) {
-            const candidate = iceCandidateBuffer.current.shift();
-            try {
-              await peerConnectionRef.current.addIceCandidate(
-                new RTCIceCandidate(candidate)
-              );
-              console.log("✅ Buffered ICE candidate added (caller side)");
-            } catch (err) {
-              console.error("Error adding buffered ICE candidate:", err);
-            }
+        console.log("✅ call:accepted — setting remote description");
+        const pc = peerConnectionRef.current;
+        if (!pc) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        remoteDescriptionSet.current = true;
+        // Apply any buffered trickle candidates
+        if (iceCandidateBuffer?.current?.length) {
+          while (iceCandidateBuffer.current.length) {
+            const c = iceCandidateBuffer.current.shift();
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (_) {}
           }
         }
-      } catch (error) {
-        console.error("Error handling call accepted:", error);
+      } catch (err) {
+        console.error("handleCallAccepted error:", err);
       }
     };
 
     const handleIceCandidate = async ({ candidate }) => {
+      if (!candidate) return;
+      const pc = peerConnectionRef.current;
+      if (!pc || !remoteDescriptionSet.current) {
+        // Buffer — remote description not set yet
+        if (iceCandidateBuffer?.current) iceCandidateBuffer.current.push(candidate);
+        return;
+      }
       try {
-        if (!candidate) return;
-
-        // If remote description is not yet set, buffer the candidate
-        if (!remoteDescriptionSet.current || !peerConnectionRef.current) {
-          console.log("🧊 Buffering ICE candidate (remote description not set yet)");
-          iceCandidateBuffer.current.push(candidate);
-          return;
-        }
-
-        await peerConnectionRef.current.addIceCandidate(
-          new RTCIceCandidate(candidate)
-        );
-        console.log("✅ ICE candidate added immediately");
-      } catch (error) {
-        console.error("Error adding ICE candidate:", error);
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn("ICE add error:", e.message);
       }
     };
 
     const handleCallEnded = () => {
-      toast({
-        title: "Call Ended",
-        status: "info",
-        duration: 3000,
-        isClosable: true,
-      });
-      endCall();
+      toast({ title: "Call Ended", status: "info", duration: 3000 });
+      // Use ref to avoid stale closure
+      if (!endCallCalledRef.current) {
+        endCallCalledRef.current = true;
+        if (localStreamRef.current) localStreamRef.current.getTracks().forEach((t) => t.stop());
+        if (peerConnectionRef.current) peerConnectionRef.current.close();
+        if (callTimerRef.current) clearInterval(callTimerRef.current);
+        onCloseRef.current();
+      }
     };
 
     const handleCallRejected = ({ reason }) => {
-      toast({
-        title: "Call Rejected",
-        description: reason || "The other party declined the call",
-        status: "warning",
-        duration: 5000,
-        isClosable: true,
-      });
-      endCall("declined");
+      toast({ title: "Call Rejected", description: reason || "Declined", status: "warning", duration: 5000 });
+      if (!endCallCalledRef.current) {
+        endCallCalledRef.current = true;
+        if (localStreamRef.current) localStreamRef.current.getTracks().forEach((t) => t.stop());
+        if (peerConnectionRef.current) peerConnectionRef.current.close();
+        if (callTimerRef.current) clearInterval(callTimerRef.current);
+        if (!isIncoming) saveCallRecord(0, "declined");
+        onCloseRef.current();
+      }
     };
 
     socket.on("call:accepted", handleCallAccepted);
@@ -597,24 +512,26 @@ const VideoCall = ({
       socket.off("call:ended", handleCallEnded);
       socket.off("call:rejected", handleCallRejected);
     };
-  }, [socket, endCall, toast]);
+    // Only depend on socket — all other values accessed via refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socket]);
 
-  // ───── Initialize call when modal opens ─────
+  // ───── Initialize call ONCE when modal opens ─────
   useEffect(() => {
-    if (isOpen) {
-      endCallCalledRef.current = false;
-      callDurationRef.current = 0;
-      remoteDescriptionSet.current = false;
-      iceCandidateBuffer.current = [];
-      setCallDuration(0);
-      setCallStatus("connecting");
-      setRemoteStream(null);
+    if (!isOpen || initializedRef.current) return;
+    initializedRef.current = true;
 
-      if (isIncoming) {
-        answerCall();
-      } else {
-        makeCall();
-      }
+    endCallCalledRef.current = false;
+    callDurationRef.current = 0;
+    remoteDescriptionSet.current = false;
+    setCallDuration(0);
+    setCallStatus("connecting");
+    setRemoteStream(null);
+
+    if (isIncoming) {
+      answerCall();
+    } else {
+      makeCall();
     }
 
     return () => {
@@ -623,7 +540,8 @@ const VideoCall = ({
         callTimerRef.current = null;
       }
     };
-  }, [isOpen, isIncoming, answerCall, makeCall]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]); // Only trigger on open — NOT on answerCall/makeCall (prevents re-init)
 
   const recipientInfo = callInfo?.recipientInfo || callInfo?.callerInfo;
 
@@ -632,10 +550,7 @@ const VideoCall = ({
       <ModalOverlay bg="blackAlpha.900" />
       <ModalContent bg="#0a0a1a" borderRadius="0" m={0}>
         <ModalBody p={0} display="flex" flexDirection="column" h="100vh">
-          {/* 
-            Audio element — ALWAYS rendered, positioned off-screen.
-            The useEffect above handles attaching remoteStream to it.
-          */}
+          {/* Audio — always rendered off-screen */}
           <audio
             ref={remoteAudioRef}
             autoPlay
@@ -643,38 +558,22 @@ const VideoCall = ({
             style={{ position: "absolute", left: "-9999px", top: "-9999px" }}
           />
 
-          {/* Audio blocked overlay */}
+          {/* Audio blocked banner */}
           {audioBlocked && callStatus === "connected" && (
             <Flex
-              position="absolute"
-              top="70px"
-              left="50%"
-              transform="translateX(-50%)"
-              zIndex={10}
-              bg="rgba(245, 87, 108, 0.9)"
-              px={4}
-              py={2}
-              borderRadius="full"
-              align="center"
-              gap={2}
-              cursor="pointer"
-              onClick={unlockAudio}
-              _hover={{ bg: "rgba(245, 87, 108, 1)" }}
-              boxShadow="0 4px 20px rgba(245, 87, 108, 0.4)"
+              position="absolute" top="70px" left="50%" transform="translateX(-50%)"
+              zIndex={10} bg="rgba(245,87,108,0.9)" px={4} py={2} borderRadius="full"
+              align="center" gap={2} cursor="pointer" onClick={unlockAudio}
+              _hover={{ bg: "rgba(245,87,108,1)" }}
+              boxShadow="0 4px 20px rgba(245,87,108,0.4)"
             >
-              <Text color="white" fontSize="sm" fontWeight="600">
-                🔊 Tap to enable audio
-              </Text>
+              <Text color="white" fontSize="sm" fontWeight="600">🔊 Tap to enable audio</Text>
             </Flex>
           )}
 
-          {/* Main video / avatar area */}
+          {/* Main area */}
           <Box flex="1" position="relative" bg="black">
-            {/* 
-              Remote video — ALWAYS rendered (not conditional on remoteStream).
-              Shown when we have a remote stream + video call; hidden otherwise.
-              This avoids the ref-is-null race condition.
-            */}
+            {/* Remote video — ALWAYS in DOM, toggled via display */}
             <video
               ref={remoteVideoRef}
               autoPlay
@@ -683,57 +582,32 @@ const VideoCall = ({
                 width: "100%",
                 height: "100%",
                 objectFit: "cover",
-                display:
-                  callType === "video" && remoteStream ? "block" : "none",
+                display: callType === "video" && remoteStream ? "block" : "none",
               }}
             />
 
-            {/* Avatar fallback — shown during voice calls or before remote video arrives */}
+            {/* Avatar fallback (voice call or while connecting) */}
             {(callType !== "video" || !remoteStream) && (
-              <Flex
-                h="100%"
-                align="center"
-                justify="center"
-                direction="column"
-                gap={{ base: 3, md: 4 }}
-                px={4}
-              >
+              <Flex h="100%" align="center" justify="center" direction="column" gap={{ base: 3, md: 4 }} px={4}>
                 <Avatar
                   size={{ base: "xl", md: "2xl" }}
                   name={recipientInfo?.name}
                   src={recipientInfo?.pic}
-                  border="4px solid"
-                  borderColor="purple.500"
+                  border="4px solid" borderColor="purple.500"
                 />
-                <Text
-                  color="white"
-                  fontSize={{ base: "lg", md: "2xl" }}
-                  fontWeight="bold"
-                  textAlign="center"
-                  isTruncated
-                  maxW="80%"
-                >
+                <Text color="white" fontSize={{ base: "lg", md: "2xl" }} fontWeight="bold" textAlign="center" isTruncated maxW="80%">
                   {recipientInfo?.name}
                 </Text>
                 <Text
-                  color="gray.400"
-                  fontSize={{ base: "sm", md: "md" }}
-                  animation={
-                    callStatus !== "connected"
-                      ? `${pulse} 1.5s infinite`
-                      : undefined
-                  }
+                  color="gray.400" fontSize={{ base: "sm", md: "md" }}
+                  animation={callStatus !== "connected" ? `${pulse} 1.5s infinite` : undefined}
                 >
-                  {callStatus === "calling"
-                    ? "Calling..."
-                    : callStatus === "connected"
-                    ? formatDuration(callDuration)
-                    : "Connecting..."}
+                  {callStatus === "calling" ? "Calling..." : callStatus === "connected" ? formatDuration(callDuration) : "Connecting..."}
                 </Text>
               </Flex>
             )}
 
-            {/* Local video (picture-in-picture) — ALWAYS rendered for video calls */}
+            {/* Local video PIP */}
             {callType === "video" && (
               <Box
                 position="absolute"
@@ -741,139 +615,68 @@ const VideoCall = ({
                 right={{ base: "10px", md: "20px" }}
                 w={{ base: "100px", md: "200px" }}
                 h={{ base: "140px", md: "150px" }}
-                borderRadius="xl"
-                overflow="hidden"
-                border="2px solid rgba(255,255,255,0.2)"
-                boxShadow="xl"
-                bg="gray.900"
+                borderRadius="xl" overflow="hidden"
+                border="2px solid rgba(255,255,255,0.2)" boxShadow="xl" bg="gray.900"
               >
                 <video
                   ref={localVideoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    objectFit: "cover",
-                    transform: "scaleX(-1)",
-                  }}
+                  autoPlay playsInline muted
+                  style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }}
                 />
                 {!isVideoOn && (
-                  <Flex
-                    position="absolute"
-                    top="0"
-                    left="0"
-                    right="0"
-                    bottom="0"
-                    align="center"
-                    justify="center"
-                    bg="gray.800"
-                  >
+                  <Flex position="absolute" top="0" left="0" right="0" bottom="0" align="center" justify="center" bg="gray.800">
                     <Text fontSize="2xl">📷</Text>
                   </Flex>
                 )}
               </Box>
             )}
 
-            {/* Call status overlay (top bar) */}
+            {/* Top status bar */}
             <Flex
-              position="absolute"
-              top="20px"
-              left="50%"
-              transform="translateX(-50%)"
-              bg="rgba(0,0,0,0.6)"
-              px={4}
-              py={2}
-              borderRadius="full"
-              align="center"
-              gap={2}
+              position="absolute" top="20px" left="50%" transform="translateX(-50%)"
+              bg="rgba(0,0,0,0.6)" px={4} py={2} borderRadius="full" align="center" gap={2}
             >
               <Box
-                w="8px"
-                h="8px"
-                borderRadius="full"
+                w="8px" h="8px" borderRadius="full"
                 bg={callStatus === "connected" ? "green.400" : "yellow.400"}
-                animation={
-                  callStatus !== "connected"
-                    ? `${pulse} 1s infinite`
-                    : undefined
-                }
+                animation={callStatus !== "connected" ? `${pulse} 1s infinite` : undefined}
               />
               <Text color="white" fontSize="sm" fontWeight="500">
-                {callStatus === "connected"
-                  ? formatDuration(callDuration)
-                  : callStatus === "calling"
-                  ? "Calling..."
-                  : "Connecting..."}
+                {callStatus === "connected" ? formatDuration(callDuration) : callStatus === "calling" ? "Calling..." : "Connecting..."}
               </Text>
             </Flex>
           </Box>
 
-          {/* Call controls */}
+          {/* Controls */}
           <Flex
-            position="absolute"
-            bottom="0"
-            left="0"
-            right="0"
-            justify="center"
-            p={{ base: 4, md: 6 }}
-            bg="linear-gradient(transparent, rgba(0,0,0,0.8))"
+            position="absolute" bottom="0" left="0" right="0" justify="center"
+            p={{ base: 4, md: 6 }} bg="linear-gradient(transparent, rgba(0,0,0,0.8))"
           >
             <HStack spacing={{ base: 4, md: 6 }}>
-              {/* Mute button */}
               <IconButton
-                icon={
-                  <MicIcon
-                    isOn={isAudioOn}
-                    fontSize={{ base: "lg", md: "xl" }}
-                  />
-                }
-                onClick={toggleAudio}
-                size={{ base: "md", md: "lg" }}
-                borderRadius="full"
-                bg={isAudioOn ? "whiteAlpha.200" : "red.500"}
-                color="white"
+                icon={<MicIcon isOn={isAudioOn} />}
+                onClick={toggleAudio} borderRadius="full"
+                bg={isAudioOn ? "whiteAlpha.200" : "red.500"} color="white"
                 _hover={{ transform: "scale(1.1)" }}
-                w={{ base: "48px", md: "60px" }}
-                h={{ base: "48px", md: "60px" }}
+                w={{ base: "48px", md: "60px" }} h={{ base: "48px", md: "60px" }}
                 aria-label={isAudioOn ? "Mute" : "Unmute"}
               />
-
-              {/* Video toggle */}
               {callType === "video" && (
                 <IconButton
-                  icon={
-                    <VideoIcon
-                      isOn={isVideoOn}
-                      fontSize={{ base: "lg", md: "xl" }}
-                    />
-                  }
-                  onClick={toggleVideo}
-                  size={{ base: "md", md: "lg" }}
-                  borderRadius="full"
-                  bg={isVideoOn ? "whiteAlpha.200" : "red.500"}
-                  color="white"
+                  icon={<VideoIcon isOn={isVideoOn} />}
+                  onClick={toggleVideo} borderRadius="full"
+                  bg={isVideoOn ? "whiteAlpha.200" : "red.500"} color="white"
                   _hover={{ transform: "scale(1.1)" }}
-                  w={{ base: "48px", md: "60px" }}
-                  h={{ base: "48px", md: "60px" }}
+                  w={{ base: "48px", md: "60px" }} h={{ base: "48px", md: "60px" }}
                   aria-label={isVideoOn ? "Turn off video" : "Turn on video"}
                 />
               )}
-
-              {/* End call button */}
               <IconButton
-                icon={
-                  <EndCallIcon fontSize={{ base: "lg", md: "xl" }} />
-                }
-                onClick={endCall}
-                size={{ base: "md", md: "lg" }}
-                borderRadius="full"
-                bg="red.500"
-                color="white"
+                icon={<EndCallIcon />}
+                onClick={endCall} borderRadius="full"
+                bg="red.500" color="white"
                 _hover={{ bg: "red.600", transform: "scale(1.1)" }}
-                w={{ base: "56px", md: "70px" }}
-                h={{ base: "56px", md: "70px" }}
+                w={{ base: "56px", md: "70px" }} h={{ base: "56px", md: "70px" }}
                 aria-label="End call"
               />
             </HStack>

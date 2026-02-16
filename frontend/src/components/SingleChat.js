@@ -124,6 +124,10 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
   const fileInputRef = useRef();
   const liveLocationInterval = useRef(null);
 
+  // Buffer for ICE candidates that arrive before VideoCall mounts.
+  // SingleChat is always rendered → never misses socket events.
+  const iceCandidateBufferRef = useRef([]);
+
   const defaultOptions = {
     loop: true,
     autoplay: true,
@@ -214,6 +218,15 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
     // Listen for online users updates
     socket.current.on("online users updated", (users) => {
       setOnlineUsers(users);
+    });
+
+    // Buffer ICE candidates at the parent level.
+    // This captures candidates even when CallNotification is showing
+    // and VideoCall hasn't mounted yet.
+    socket.current.on("call:ice-candidate", ({ candidate }) => {
+      if (candidate) {
+        iceCandidateBufferRef.current.push(candidate);
+      }
     });
 
     // Cleanup on component unmount
@@ -604,6 +617,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
 
   const startCall = (callType) => {
     if (!selectedChat || selectedChat.isGroupChat) return;
+    iceCandidateBufferRef.current = []; // clear buffer for fresh call
     
     const recipient = getSenderFull(user, selectedChat.users);
     
@@ -639,6 +653,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
 
   const handleAcceptCall = () => {
     if (incomingCall) {
+      // Don't clear buffer here — it may contain candidates from the caller
       setCallInfo({
         ...incomingCall,
         callerId: incomingCall.from,
@@ -1278,6 +1293,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
           onClose={() => {
             setIsInCall(false);
             setCallInfo(null);
+            iceCandidateBufferRef.current = []; // clear buffer after call
           }}
           socket={socket.current}
           callInfo={callInfo}
@@ -1288,6 +1304,7 @@ const SingleChat = ({ fetchAgain, setFetchAgain }) => {
           onCallEnded={(callMsg) => {
             if (callMsg) setMessages((prev) => [...prev, callMsg]);
           }}
+          iceCandidateBuffer={iceCandidateBufferRef}
         />
       )}
 
