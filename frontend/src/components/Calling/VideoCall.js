@@ -137,6 +137,17 @@ const VideoCall = ({
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
+  // ───── useEffect: set --vh CSS variable for mobile viewport fix ─────
+  // On mobile, 100vh includes the browser chrome. This gives us the real height.
+  useEffect(() => {
+    const setVh = () => {
+      document.documentElement.style.setProperty("--vh", `${window.innerHeight}px`);
+    };
+    setVh();
+    window.addEventListener("resize", setVh);
+    return () => window.removeEventListener("resize", setVh);
+  }, []);
+
   // ───── useEffect: attach LOCAL stream to video element ─────
   useEffect(() => {
     if (localVideoRef.current && localStream && callType === "video") {
@@ -545,12 +556,21 @@ const VideoCall = ({
 
   const recipientInfo = callInfo?.recipientInfo || callInfo?.callerInfo;
 
+  // ──── Fully absolute-positioned layout ────
+  // On mobile, flex + height:100% is unreliable for <video>.
+  // Instead, every layer is position:absolute over the full viewport.
   return (
-    <Modal isOpen={isOpen} onClose={endCall} size="full">
+    <Modal isOpen={isOpen} onClose={endCall} size="full" motionPreset="none">
       <ModalOverlay bg="blackAlpha.900" />
-      <ModalContent bg="#0a0a1a" borderRadius="0" m={0}>
-        <ModalBody p={0} display="flex" flexDirection="column" h="100vh">
-          {/* Audio — always rendered off-screen */}
+      <ModalContent bg="black" borderRadius="0" m={0} maxH="100vh" overflow="hidden">
+        <ModalBody
+          p={0}
+          position="relative"
+          w="100vw"
+          h="var(--vh, 100vh)"
+          overflow="hidden"
+        >
+          {/* Hidden audio element */}
           <audio
             ref={remoteAudioRef}
             autoPlay
@@ -558,10 +578,91 @@ const VideoCall = ({
             style={{ position: "absolute", left: "-9999px", top: "-9999px" }}
           />
 
-          {/* Audio blocked banner */}
+          {/* ── Layer 0: Black background ── */}
+          <Box position="absolute" top={0} left={0} right={0} bottom={0} bg="black" zIndex={0} />
+
+          {/* ── Layer 1: Remote video — full-screen absolute ── */}
+          <Box
+            as="video"
+            ref={remoteVideoRef}
+            autoPlay
+            playsInline
+            position="absolute"
+            top={0}
+            left={0}
+            w="100%"
+            h="100%"
+            objectFit="cover"
+            zIndex={1}
+            display={callType === "video" && remoteStream ? "block" : "none"}
+            sx={{ objectFit: "cover" }}
+          />
+
+          {/* ── Layer 1b: Avatar fallback (voice / connecting) ── */}
+          {(callType !== "video" || !remoteStream) && (
+            <Flex
+              position="absolute" top={0} left={0} right={0} bottom={0}
+              align="center" justify="center" direction="column"
+              gap={{ base: 3, md: 4 }} px={4} zIndex={1}
+            >
+              <Avatar
+                size={{ base: "xl", md: "2xl" }}
+                name={recipientInfo?.name}
+                src={recipientInfo?.pic}
+                border="4px solid" borderColor="purple.500"
+              />
+              <Text
+                color="white" fontSize={{ base: "lg", md: "2xl" }}
+                fontWeight="bold" textAlign="center" noOfLines={1} maxW="80%"
+              >
+                {recipientInfo?.name}
+              </Text>
+              <Text
+                color="gray.400" fontSize={{ base: "sm", md: "md" }}
+                animation={callStatus !== "connected" ? `${pulse} 1.5s infinite` : undefined}
+              >
+                {callStatus === "calling"
+                  ? "Calling..."
+                  : callStatus === "connected"
+                  ? formatDuration(callDuration)
+                  : "Connecting..."}
+              </Text>
+            </Flex>
+          )}
+
+          {/* ── Layer 2: Top status bar ── */}
+          <Flex
+            position="absolute"
+            top={{ base: "12px", md: "20px" }}
+            left="50%"
+            transform="translateX(-50%)"
+            bg="rgba(0,0,0,0.55)"
+            backdropFilter="blur(8px)"
+            px={4} py={1.5}
+            borderRadius="full"
+            align="center" gap={2}
+            zIndex={5}
+          >
+            <Box
+              w="8px" h="8px" borderRadius="full"
+              bg={callStatus === "connected" ? "green.400" : "yellow.400"}
+              animation={callStatus !== "connected" ? `${pulse} 1s infinite` : undefined}
+            />
+            <Text color="white" fontSize="sm" fontWeight="500">
+              {callStatus === "connected"
+                ? formatDuration(callDuration)
+                : callStatus === "calling"
+                ? "Calling..."
+                : "Connecting..."}
+            </Text>
+          </Flex>
+
+          {/* ── Audio blocked banner ── */}
           {audioBlocked && callStatus === "connected" && (
             <Flex
-              position="absolute" top="70px" left="50%" transform="translateX(-50%)"
+              position="absolute"
+              top={{ base: "55px", md: "70px" }}
+              left="50%" transform="translateX(-50%)"
               zIndex={10} bg="rgba(245,87,108,0.9)" px={4} py={2} borderRadius="full"
               align="center" gap={2} cursor="pointer" onClick={unlockAudio}
               _hover={{ bg: "rgba(245,87,108,1)" }}
@@ -571,94 +672,58 @@ const VideoCall = ({
             </Flex>
           )}
 
-          {/* Main area */}
-          <Box flex="1" position="relative" bg="black">
-            {/* Remote video — ALWAYS in DOM, toggled via display */}
-            <video
-              ref={remoteVideoRef}
-              autoPlay
-              playsInline
-              style={{
-                width: "100%",
-                height: "100%",
-                objectFit: "cover",
-                display: callType === "video" && remoteStream ? "block" : "none",
-              }}
-            />
-
-            {/* Avatar fallback (voice call or while connecting) */}
-            {(callType !== "video" || !remoteStream) && (
-              <Flex h="100%" align="center" justify="center" direction="column" gap={{ base: 3, md: 4 }} px={4}>
-                <Avatar
-                  size={{ base: "xl", md: "2xl" }}
-                  name={recipientInfo?.name}
-                  src={recipientInfo?.pic}
-                  border="4px solid" borderColor="purple.500"
-                />
-                <Text color="white" fontSize={{ base: "lg", md: "2xl" }} fontWeight="bold" textAlign="center" isTruncated maxW="80%">
-                  {recipientInfo?.name}
-                </Text>
-                <Text
-                  color="gray.400" fontSize={{ base: "sm", md: "md" }}
-                  animation={callStatus !== "connected" ? `${pulse} 1.5s infinite` : undefined}
-                >
-                  {callStatus === "calling" ? "Calling..." : callStatus === "connected" ? formatDuration(callDuration) : "Connecting..."}
-                </Text>
-              </Flex>
-            )}
-
-            {/* Local video PIP */}
-            {callType === "video" && (
-              <Box
-                position="absolute"
-                bottom={{ base: "120px", md: "100px" }}
-                right={{ base: "10px", md: "20px" }}
-                w={{ base: "100px", md: "200px" }}
-                h={{ base: "140px", md: "150px" }}
-                borderRadius="xl" overflow="hidden"
-                border="2px solid rgba(255,255,255,0.2)" boxShadow="xl" bg="gray.900"
-              >
-                <video
-                  ref={localVideoRef}
-                  autoPlay playsInline muted
-                  style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }}
-                />
-                {!isVideoOn && (
-                  <Flex position="absolute" top="0" left="0" right="0" bottom="0" align="center" justify="center" bg="gray.800">
-                    <Text fontSize="2xl">📷</Text>
-                  </Flex>
-                )}
-              </Box>
-            )}
-
-            {/* Top status bar */}
-            <Flex
-              position="absolute" top="20px" left="50%" transform="translateX(-50%)"
-              bg="rgba(0,0,0,0.6)" px={4} py={2} borderRadius="full" align="center" gap={2}
+          {/* ── Layer 3: Local PIP video ── */}
+          {callType === "video" && (
+            <Box
+              position="absolute"
+              bottom={{ base: "110px", md: "110px" }}
+              right={{ base: "12px", md: "20px" }}
+              w={{ base: "90px", md: "180px" }}
+              h={{ base: "120px", md: "140px" }}
+              borderRadius="xl" overflow="hidden"
+              border="2px solid rgba(255,255,255,0.25)"
+              boxShadow="0 4px 20px rgba(0,0,0,0.6)"
+              bg="gray.900"
+              zIndex={5}
             >
-              <Box
-                w="8px" h="8px" borderRadius="full"
-                bg={callStatus === "connected" ? "green.400" : "yellow.400"}
-                animation={callStatus !== "connected" ? `${pulse} 1s infinite` : undefined}
+              <video
+                ref={localVideoRef}
+                autoPlay playsInline muted
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "cover",
+                  transform: "scaleX(-1)",
+                }}
               />
-              <Text color="white" fontSize="sm" fontWeight="500">
-                {callStatus === "connected" ? formatDuration(callDuration) : callStatus === "calling" ? "Calling..." : "Connecting..."}
-              </Text>
-            </Flex>
-          </Box>
+              {!isVideoOn && (
+                <Flex
+                  position="absolute" top={0} left={0} right={0} bottom={0}
+                  align="center" justify="center" bg="gray.800"
+                >
+                  <Text fontSize="2xl">📷</Text>
+                </Flex>
+              )}
+            </Box>
+          )}
 
-          {/* Controls */}
+          {/* ── Layer 4: Controls bar ── */}
           <Flex
-            position="absolute" bottom="0" left="0" right="0" justify="center"
-            p={{ base: 4, md: 6 }} bg="linear-gradient(transparent, rgba(0,0,0,0.8))"
+            position="absolute"
+            bottom={0} left={0} right={0}
+            justify="center"
+            pt={8}
+            pb={{ base: "28px", md: "32px" }}
+            bg="linear-gradient(transparent, rgba(0,0,0,0.85) 40%)"
+            zIndex={5}
           >
-            <HStack spacing={{ base: 4, md: 6 }}>
+            <HStack spacing={{ base: 5, md: 6 }}>
               <IconButton
                 icon={<MicIcon isOn={isAudioOn} />}
                 onClick={toggleAudio} borderRadius="full"
                 bg={isAudioOn ? "whiteAlpha.200" : "red.500"} color="white"
                 _hover={{ transform: "scale(1.1)" }}
-                w={{ base: "48px", md: "60px" }} h={{ base: "48px", md: "60px" }}
+                w="52px" h="52px" fontSize="xl"
                 aria-label={isAudioOn ? "Mute" : "Unmute"}
               />
               {callType === "video" && (
@@ -667,7 +732,7 @@ const VideoCall = ({
                   onClick={toggleVideo} borderRadius="full"
                   bg={isVideoOn ? "whiteAlpha.200" : "red.500"} color="white"
                   _hover={{ transform: "scale(1.1)" }}
-                  w={{ base: "48px", md: "60px" }} h={{ base: "48px", md: "60px" }}
+                  w="52px" h="52px" fontSize="xl"
                   aria-label={isVideoOn ? "Turn off video" : "Turn on video"}
                 />
               )}
@@ -676,7 +741,7 @@ const VideoCall = ({
                 onClick={endCall} borderRadius="full"
                 bg="red.500" color="white"
                 _hover={{ bg: "red.600", transform: "scale(1.1)" }}
-                w={{ base: "56px", md: "70px" }} h={{ base: "56px", md: "70px" }}
+                w="60px" h="60px" fontSize="xl"
                 aria-label="End call"
               />
             </HStack>
